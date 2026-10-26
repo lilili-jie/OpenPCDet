@@ -1,0 +1,46 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/bevfusion.yaml
+
+# CCF domain-generalization baseline.  Training and checkpoint selection use
+# Singapore non-rain daytime Source only.  Target-domain info files must only
+# be supplied to test.py at evaluation time.
+DATA_CONFIG:
+    # OpenPCDet only resolves _BASE_CONFIG_ one level deep.  Since this file
+    # already inherits bevfusion.yaml, spell out the common nuScenes fields
+    # here instead of adding a second nested base that would overwrite the
+    # BEVFusion camera augmentation and image processors.
+    DATASET: NuScenesDataset
+    DATA_PATH: ../data/nuscenes
+    VERSION: v1.0-trainval
+    MAX_SWEEPS: 10
+    PRED_VELOCITY: True
+    SET_NAN_VELOCITY_TO_ZEROS: True
+    FILTER_MIN_POINTS_IN_GT: 1
+    DATA_SPLIT: {
+        'train': train,
+        'test': val,
+    }
+    INFO_PATH: {
+        'train': [nuscenes_infos_train_singapore_norain_day_source.pkl],
+        'test': [nuscenes_infos_val_singapore_norain_day_source.pkl],
+    }
+    BALANCED_RESAMPLING: True
+    POINT_FEATURE_ENCODING: {
+        encoding_type: absolute_coordinates_encoding,
+        used_feature_list: ['x', 'y', 'z', 'intensity', 'timestamp'],
+        src_feature_list: ['x', 'y', 'z', 'intensity', 'timestamp'],
+    }
+
+MODEL:
+    IMAGE_BACKBONE:
+        # The CCF Faster R-CNN checkpoint already uses MMDetection Swin keys
+        # (backbone.patch_embed.*, backbone.stages.*, ...), so it must not be
+        # passed through the Microsoft-original Swin key converter again.
+        CONVERT_WEIGHTS: False
+        INIT_CFG:
+            type: Pretrained
+            checkpoint: ../../../checkpoints/faster_rcnn_swint_fpn_source.pth
+
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 3
+    NUM_EPOCHS: 6
+    LR: 0.0001
