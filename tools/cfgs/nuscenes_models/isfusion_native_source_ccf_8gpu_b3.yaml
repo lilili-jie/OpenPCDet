@@ -1,0 +1,9 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf.yaml
+
+# Formal 8-GPU recipe: 8 GPUs x 3 samples/GPU = global batch 24.
+# The base peak LR is 5e-4 for global batch 16, so linear scaling gives:
+# 5e-4 * 24 / 16 = 7.5e-4.
+# NUM_EPOCHS remains inherited from the base configuration (10 epochs).
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 3
+    LR: 0.00075

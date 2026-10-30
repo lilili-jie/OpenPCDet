@@ -24,13 +24,23 @@ def build_optimizer(model, optim_cfg):
             return len(children(m))
 
         flatten_model = lambda m: sum(map(flatten_model, m.children()), []) if num_children(m) else [m]
-        get_layer_groups = lambda m: [nn.Sequential(*flatten_model(m))]
+        image_lr_mult = optim_cfg.get('IMAGE_BACKBONE_LR_MULT', None)
+        if image_lr_mult is not None and hasattr(model, 'img_backbone'):
+            # Keep top-level modules as groups to avoid assigning parameters twice.
+            other_modules = [module for module in model.children() if module is not model.img_backbone]
+            layer_groups = [nn.Sequential(*other_modules), nn.Sequential(model.img_backbone)]
+            lr_multipliers = [1.0, float(image_lr_mult)]
+        else:
+            layer_groups = [nn.Sequential(*flatten_model(model))]
+            lr_multipliers = None
         betas = optim_cfg.get('BETAS', (0.9, 0.99))
         betas = tuple(betas)
         optimizer_func = partial(optim.Adam, betas=betas)
         optimizer = OptimWrapper.create(
-            optimizer_func, 3e-3, get_layer_groups(model), wd=optim_cfg.WEIGHT_DECAY, true_wd=True, bn_wd=True
+            optimizer_func, optim_cfg.LR, layer_groups,
+            wd=optim_cfg.WEIGHT_DECAY, true_wd=True, bn_wd=True
         )
+        optimizer.lr_multipliers = lr_multipliers
     else:
         raise NotImplementedError
 
@@ -38,7 +48,7 @@ def build_optimizer(model, optim_cfg):
 
 
 def build_scheduler(optimizer, total_iters_each_epoch, total_epochs, last_epoch, optim_cfg):
-    decay_steps = [x * total_iters_each_epoch for x in optim_cfg.DECAY_STEP_LIST]
+    decay_steps = [x * total_iters_each_epoch for x in optim_cfg.get('DECAY_STEP_LIST', [])]
     def lr_lbmd(cur_epoch):
         cur_decay = 1
         for decay_step in decay_steps:
@@ -50,7 +60,9 @@ def build_scheduler(optimizer, total_iters_each_epoch, total_epochs, last_epoch,
     total_steps = total_iters_each_epoch * total_epochs
     if optim_cfg.OPTIMIZER == 'adam_onecycle':
         lr_scheduler = OneCycle(
-            optimizer, total_steps, optim_cfg.LR, list(optim_cfg.MOMS), optim_cfg.DIV_FACTOR, optim_cfg.PCT_START
+            optimizer, total_steps, optim_cfg.LR, list(optim_cfg.MOMS),
+            optim_cfg.DIV_FACTOR, optim_cfg.PCT_START,
+            lr_multipliers=getattr(optimizer, 'lr_multipliers', None)
         )
     elif optim_cfg.OPTIMIZER == 'adam_cosineanneal':
         lr_scheduler = CosineAnnealing(

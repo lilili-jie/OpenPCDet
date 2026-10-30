@@ -15,6 +15,8 @@ from .pillarnet import PillarNet
 from .voxelnext import VoxelNeXt
 from .transfusion import TransFusion
 from .bevfusion import BevFusion
+from .isfusion import ISFusion
+from .isfusion_native import ISFusionNative
 
 __all__ = {
     'Detector3DTemplate': Detector3DTemplate,
@@ -35,6 +37,8 @@ __all__ = {
     'VoxelNeXt': VoxelNeXt,
     'TransFusion': TransFusion,
     'BevFusion': BevFusion,
+    'ISFusion': ISFusion,
+    'ISFusionNative': ISFusionNative,
 }
 
 

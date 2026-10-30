@@ -29,6 +29,7 @@ class GeneralizedLSSFPN(nn.Module):
             assert num_outs == end_level - start_level
         self.start_level = start_level
         self.end_level = end_level
+        self.align_corners = self.model_cfg.get('ALIGN_CORNERS', False)
 
         self.lateral_convs = nn.ModuleList()
         self.fpn_convs = nn.ModuleList()
@@ -64,7 +65,7 @@ class GeneralizedLSSFPN(nn.Module):
             x = F.interpolate(
                 laterals[i + 1],
                 size=laterals[i].shape[2:],
-                mode='bilinear', align_corners=False,
+                mode='bilinear', align_corners=self.align_corners,
             )
             laterals[i] = torch.cat([laterals[i], x], dim=1)
             laterals[i] = self.lateral_convs[i](laterals[i])

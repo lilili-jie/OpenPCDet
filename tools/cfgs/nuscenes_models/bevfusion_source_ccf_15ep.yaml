@@ -20,8 +20,8 @@ DATA_CONFIG:
         'test': val,
     }
     INFO_PATH: {
-        'train': [nuscenes_infos_train_singapore_norain_day_source.pkl],
-        'test': [nuscenes_infos_val_singapore_norain_day_source.pkl],
+        'train': [pkl_9history_padded/nuscenes_infos_train_singapore_norain_day_source.pkl],
+        'test': [pkl_9history_padded/nuscenes_infos_val_singapore_norain_day_source.pkl],
     }
     BALANCED_RESAMPLING: True
     POINT_FEATURE_ENCODING: {

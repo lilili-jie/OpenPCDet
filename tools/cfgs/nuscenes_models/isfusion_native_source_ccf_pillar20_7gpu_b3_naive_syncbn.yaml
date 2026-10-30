@@ -1,0 +1,14 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf.yaml
+
+# Controlled reproduction variant.  This is identical to the existing
+# 7-GPU x 3 recipe except that the two DynamicVFE normalization layers use
+# the reference IS-Fusion equal-worker-weight NaiveSyncBatchNorm1d.
+MODEL:
+    VFE:
+        NORM_TYPE: naive_sync_bn
+    PILLAR_SAMPLER:
+        NUM_POINTS_IN_PILLAR: 20
+
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 3
+    LR: 0.00065625

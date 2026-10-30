@@ -1,7 +1,9 @@
 from functools import partial
+import multiprocessing as mp
 
 import numpy as np
 from PIL import Image
+import random
 
 from ...utils import common_utils
 from . import augmentor_utils, database_sampler
@@ -14,6 +16,7 @@ class DataAugmentor(object):
         self.logger = logger
 
         self.data_augmentor_queue = []
+        self.data_augmentor_names = []
         aug_config_list = augmentor_configs if isinstance(augmentor_configs, list) \
             else augmentor_configs.AUG_CONFIG_LIST
 
@@ -23,18 +26,20 @@ class DataAugmentor(object):
                     continue
             cur_augmentor = getattr(self, cur_cfg.NAME)(config=cur_cfg)
             self.data_augmentor_queue.append(cur_augmentor)
+            self.data_augmentor_names.append(cur_cfg.NAME)
+        # Shared flags let the epoch hook update already-forked DataLoader
+        # workers. Rebuilding only the main-process queue is insufficient.
+        self.disabled_augmentor_flags = mp.Array(
+            'b', [0] * len(self.data_augmentor_queue), lock=False
+        )
 
     def disable_augmentation(self, augmentor_configs):
-        self.data_augmentor_queue = []
-        aug_config_list = augmentor_configs if isinstance(augmentor_configs, list) \
-            else augmentor_configs.AUG_CONFIG_LIST
-
-        for cur_cfg in aug_config_list:
-            if not isinstance(augmentor_configs, list):
-                if cur_cfg.NAME in augmentor_configs.DISABLE_AUG_LIST:
-                    continue
-            cur_augmentor = getattr(self, cur_cfg.NAME)(config=cur_cfg)
-            self.data_augmentor_queue.append(cur_augmentor)
+        disabled = set(
+            [] if isinstance(augmentor_configs, list)
+            else augmentor_configs.DISABLE_AUG_LIST
+        )
+        for index, name in enumerate(self.data_augmentor_names):
+            self.disabled_augmentor_flags[index] = int(name in disabled)
              
     def gt_sampling(self, config=None):
         db_sampler = database_sampler.DataBaseSampler(
@@ -287,6 +292,61 @@ class DataAugmentor(object):
         data_dict["camera_imgs"] = new_imgs
         return data_dict
 
+    def isfusion_modal_mask(self, data_dict=None, config=None):
+        """Match IS-Fusion ``ModalMask3D(mode='train')``.
+
+        The actual zeroing is deferred to the detector so that a masked view
+        becomes exactly zero *after* image normalization, as in the original
+        implementation.
+        """
+        if data_dict is None:
+            return partial(self.isfusion_modal_mask, config=config)
+        num_views = len(data_dict['camera_imgs'])
+        num_drop = int(config.get('NUM_DROP_VIEWS', 3))
+        if np.random.rand() > float(config.get('DROP_PROBABILITY', 0.5)):
+            data_dict['img_mask_idx'] = np.asarray(
+                random.sample(range(num_views), num_drop), dtype=np.int64
+            )
+        else:
+            data_dict['img_mask_idx'] = np.full(
+                num_drop, -1, dtype=np.int64
+            )
+        return data_dict
+
+    def isfusion_global_transform(self, data_dict=None, config=None):
+        """IS-Fusion global rotation, translation and scale in one operator.
+
+        Its order intentionally follows ``GlobalRotScaleTransV2``: rotate,
+        translate, then scale.  Storing the scaled translation makes
+        ``DatasetTemplate.set_lidar_aug_matrix`` describe the same transform
+        used for points and boxes.
+        """
+        if data_dict is None:
+            return partial(self.isfusion_global_transform, config=config)
+        rotation = np.random.uniform(*config.ROT_LIM)
+        translation = np.asarray([
+            np.random.normal(0.0, float(config.TRANS_STD)) for _ in range(3)
+        ], dtype=np.float32)
+        scale = np.random.uniform(*config.SCALE_LIM)
+
+        gt_boxes, points, _ = augmentor_utils.global_rotation(
+            data_dict['gt_boxes'], data_dict['points'],
+            rot_range=config.ROT_LIM, return_rot=True,
+            noise_rotation=rotation,
+        )
+        points[:, :3] += translation
+        gt_boxes[:, :3] += translation
+        gt_boxes, points, _ = augmentor_utils.global_scaling(
+            gt_boxes, points, scale_range=config.SCALE_LIM,
+            return_scale=True, noise_scale=scale,
+        )
+        data_dict['gt_boxes'] = gt_boxes
+        data_dict['points'] = points
+        data_dict['noise_rot'] = rotation
+        data_dict['noise_scale'] = scale
+        data_dict['noise_translate'] = (translation * scale).reshape(1, 3)
+        return data_dict
+
     def forward(self, data_dict):
         """
         Args:
@@ -298,8 +358,16 @@ class DataAugmentor(object):
 
         Returns:
         """
-        for cur_augmentor in self.data_augmentor_queue:
+        for index, cur_augmentor in enumerate(self.data_augmentor_queue):
+            if self.disabled_augmentor_flags[index]:
+                continue
             data_dict = cur_augmentor(data_dict=data_dict)
+
+        # This variable-length field is only an input to the multimodal GT
+        # database sampler.  The sampler normally consumes it itself, but it
+        # remains in the sample when gt_sampling is disabled for the final
+        # epochs and cannot be stacked by DatasetTemplate.collate_batch.
+        data_dict.pop('_gt_boxes2d_for_sampling', None)
 
         data_dict['gt_boxes'][:, 6] = common_utils.limit_period(
             data_dict['gt_boxes'][:, 6], offset=0.5, period=2 * np.pi

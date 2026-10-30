@@ -7,8 +7,8 @@ DATA_CONFIG:
     _BASE_CONFIG_: cfgs/dataset_configs/nuscenes_dataset.yaml
 
     INFO_PATH: {
-        'train': [nuscenes_infos_train_singapore_norain_day_source.pkl],
-        'test': [nuscenes_infos_val_singapore_norain_day_source.pkl],
+        'train': [pkl_9history_padded/nuscenes_infos_train_singapore_norain_day_source.pkl],
+        'test': [pkl_9history_padded/nuscenes_infos_val_singapore_norain_day_source.pkl],
     }
 
     POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
@@ -18,7 +18,7 @@ DATA_CONFIG:
         AUG_CONFIG_LIST:
             - NAME: gt_sampling
               DB_INFO_PATH:
-                  - nuscenes_dbinfos_source_10sweeps_withvelo.pkl
+                  - pkl_9history_padded/nuscenes_dbinfos_source_10sweeps_withvelo.pkl
               PREPARE: {
                 filter_by_min_points: [
                     'car:5','truck:5', 'construction_vehicle:5', 'bus:5', 'trailer:5',

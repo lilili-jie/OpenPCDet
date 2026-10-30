@@ -1,0 +1,241 @@
+CLASS_NAMES: ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+              'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+
+DATA_CONFIG:
+    DATASET: NuScenesDataset
+    DATA_PATH: ../data/nuscenes
+    VERSION: v1.0-trainval
+    # Total LiDAR frames: current keyframe plus at most 10 historical sweeps.
+    # Read the native OpenPCDet sweep records generated in
+    # pkl_10history_unpadded; do not replace them with CCF/MMDet3D records.
+    MAX_SWEEPS: 11
+    CCF_COMPATIBLE_SWEEPS: False
+    CCF_SPLIT_DIR: ../../splits
+    CCF_CANONICAL_TRAIN_INFO: nuscenes_infos_train_singapore_norain_day_source.pkl
+    PRED_VELOCITY: True
+    TRAIN_WITH_SPEED: True
+    SET_NAN_VELOCITY_TO_ZEROS: True
+    FILTER_MIN_POINTS_IN_GT: 1
+    POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+    DATA_SPLIT: {'train': train, 'test': val}
+    INFO_PATH: {
+        'train': [pkl_10history_unpadded/nuscenes_infos_train_singapore_norain_day_source_10history_multimodal.pkl],
+        'test': [pkl_10history_unpadded/nuscenes_infos_val_singapore_norain_day_source_10history.pkl],
+    }
+    # CBGSDataset in the reference recipe.
+    BALANCED_RESAMPLING: True
+    POINT_FEATURE_ENCODING: {
+        encoding_type: absolute_coordinates_encoding,
+        used_feature_list: ['x', 'y', 'z', 'intensity', 'timestamp'],
+        src_feature_list: ['x', 'y', 'z', 'intensity', 'timestamp'],
+    }
+    CAMERA_CONFIG:
+        USE_CAMERA: True
+        CCF_COMPATIBLE_IMAGE_IO: True
+        CCF_COMPATIBLE_CALIBRATION: True
+        CCF_COMPATIBLE_NORMALIZATION: True
+        IMAGE:
+            FINAL_DIM: [384, 1056]
+            RESIZE_LIM_TRAIN: [0.57, 0.825]
+            RESIZE_LIM_TEST: [0.72, 0.72]
+    DATA_AUGMENTOR:
+        DISABLE_AUG_LIST: ['placeholder']
+        AUG_CONFIG_LIST:
+            # Source-only counterpart of ObjectSampleV2.  The database was
+            # built only from the 9050 Singapore/day/no-rain train samples.
+            - NAME: gt_sampling
+              DB_INFO_PATH:
+                  - pkl_10history_unpadded/nuscenes_dbinfos_source_10history_withvelo_multimodal.pkl
+              PREPARE: {
+                 filter_by_min_points: [
+                     'car:5', 'truck:5', 'construction_vehicle:5', 'bus:5',
+                     'trailer:5', 'barrier:5', 'motorcycle:5', 'bicycle:5',
+                     'pedestrian:5', 'traffic_cone:5'
+                 ],
+              }
+              SAMPLE_GROUPS: [
+                  'car:2', 'truck:3', 'construction_vehicle:7', 'bus:4',
+                  'trailer:6', 'barrier:2', 'motorcycle:6', 'bicycle:6',
+                  'pedestrian:2', 'traffic_cone:2'
+              ]
+              NUM_POINT_FEATURES: 5
+              DATABASE_WITH_FAKELIDAR: False
+              REMOVE_EXTRA_WIDTH: [0.0, 0.0, 0.0]
+              LIMIT_WHOLE_SCENE: True
+              SOURCE_MULTIMODAL: True
+              MIXUP: 0.7
+              CHECK_2D_COLLISION: True
+              COLLISION_THR: [0.0, 0.3, 0.5, 0.7]
+              # Reference MMDataBaseSamplerV2 default: sampled objects from
+              # different classes are not added to the collision-avoid set.
+              COLLISION_IN_CLASSES: False
+
+            - NAME: isfusion_modal_mask
+              NUM_DROP_VIEWS: 3
+              DROP_PROBABILITY: 0.5
+
+            # ImageAug3D's resize/crop is performed while loading cameras;
+            # this stage adds its per-view flip and rotation.
+            - NAME: imgaug
+              ROT_LIM: [-5.4, 5.4]
+              RAND_FLIP: True
+
+            - NAME: isfusion_global_transform
+              ROT_LIM: [-0.78539816, 0.78539816]
+              SCALE_LIM: [0.9, 1.1]
+              TRANS_STD: 0.5
+
+            - NAME: random_world_flip
+              ALONG_AXIS_LIST: ['x', 'y']
+    DATA_PROCESSOR:
+        - NAME: mask_points_outside_range_3d_strict
+        # Reference ObjectRangeFilter: strict x/y centre bounds after all
+        # global geometry augmentation; z is intentionally not checked.
+        - NAME: mask_boxes_outside_range_bev_strict
+        - NAME: shuffle_points
+          SHUFFLE_ENABLED: {'train': True, 'test': False}
+        - NAME: calculate_grid_size
+          VOXEL_SIZE: [0.075, 0.075, 0.2]
+        - NAME: image_calibrate
+          CCF_COMPATIBLE: True
+        - NAME: image_normalize
+          CCF_COMPATIBLE: True
+          mean: [123.675, 116.28, 103.53]
+          std: [58.395, 57.12, 57.375]
+
+MODEL:
+    NAME: ISFusionNative
+    # Initialize Swin-T from the Source-only 2D detector and keep it fixed,
+    # matching detach=True in the reference IS-Fusion recipe.
+    # GeneralizedLSSFPN remains trainable: Faster R-CNN's FPN is structurally
+    # incompatible with ISFusion's image neck.
+    FREEZE_IMAGE_BACKBONE: True
+    # Matches the released IS-Fusion runtime configuration. Some auxiliary
+    # proposal parameters are not connected to every training loss.
+    FIND_UNUSED_PARAMETERS: True
+    VFE:
+        NAME: ISFusionDynamicVFE
+        NUM_FILTERS: [64, 64]
+        WITH_CLUSTER_CENTER: True
+        WITH_VOXEL_CENTER: True
+        WITH_DISTANCE: False
+        # Match the original IS-Fusion DynamicVFEV2 norm_cfg:
+        # naiveSyncBN1d synchronizes per-worker point statistics in DDP.
+        NORM_TYPE: naive_sync_bn
+        NORM_EPS: 0.001
+        NORM_MOMENTUM: 0.01
+    BACKBONE_3D:
+        NAME: ISFusionSparseEncoder
+        SPARSE_SHAPE: [41, 1440, 1440]
+        NORM_EPS: 0.001
+        NORM_MOMENTUM: 0.01
+    IMAGE_BACKBONE:
+        NAME: SwinTransformer
+        EMBED_DIMS: 96
+        DEPTHS: [2, 2, 6, 2]
+        NUM_HEADS: [3, 6, 12, 24]
+        WINDOW_SIZE: 7
+        MLP_RATIO: 4
+        DROP_RATE: 0.0
+        ATTN_DROP_RATE: 0.0
+        DROP_PATH_RATE: 0.2
+        PATCH_NORM: True
+        OUT_INDICES: [1, 2, 3]
+        WITH_CP: False
+        CONVERT_WEIGHTS: False
+        INIT_CFG:
+            checkpoint: ../../../checkpoints/faster_rcnn_swint_fpn_source.pth
+    IMAGE_NECK:
+        NAME: GeneralizedLSSFPN
+        IN_CHANNELS: [192, 384, 768]
+        OUT_CHANNELS: 256
+        START_LEVEL: 0
+        END_LEVEL: -1
+        NUM_OUTS: 3
+        ALIGN_CORNERS: True
+    PILLAR_SAMPLER:
+        NUM_POINTS_IN_PILLAR: 20
+        NUM_VIEWS: 6
+        EMBED_DIMS: 256
+        BEV_SIZE: 180
+        POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+        PILLAR_SIZE: [0.6, 0.6, 8.0]
+        # Same hard-voxelization limits as CCF's Voxelization((30000, 60000)).
+        MAX_VOXELS_TRAIN: 30000
+        MAX_VOXELS_TEST: 60000
+        FEATURE_LEVEL: 1
+        RANDOM_NOISE: 1.0
+    FUSION_ENCODER: {}
+    BACKBONE_2D:
+        LAYER_NUMS: [5, 5]
+        LAYER_STRIDES: [1, 2]
+        NUM_FILTERS: [128, 256]
+    BEV_NECK:
+        IN_CHANNELS: [128, 256]
+        NUM_UPSAMPLE_FILTERS: [256, 256]
+        UPSAMPLE_STRIDES: [1, 2]
+        USE_CONV_FOR_NO_STRIDE: True
+    DENSE_HEAD:
+        NAME: ISFusionTransFusionHead
+        CLASS_AGNOSTIC: False
+        SEPARATE_HEAD_CFG:
+            HEAD_ORDER: ['center', 'height', 'dim', 'rot', 'vel']
+        TARGET_ASSIGNER_CONFIG:
+            FEATURE_MAP_STRIDE: 8
+            DATASET: nuScenes
+            GAUSSIAN_OVERLAP: 0.1
+            MIN_RADIUS: 2
+            HUNGARIAN_ASSIGNER:
+                cls_cost: {'gamma': 2.0, 'alpha': 0.25, 'weight': 0.15}
+                reg_cost: {'weight': 0.25}
+                iou_cost: {'weight': 0.25}
+        LOSS_CONFIG:
+            LOSS_WEIGHTS:
+                cls_weight: 1.0
+                bbox_weight: 0.25
+                hm_weight: 1.0
+                code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+            LOSS_CLS: {use_sigmoid: True, gamma: 2.0, alpha: 0.25}
+        POST_PROCESSING:
+            SCORE_THRESH: 0.0
+            POST_CENTER_RANGE: [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
+    POST_PROCESSING:
+        RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+        EVAL_METRIC: nuscenes
+
+OPTIMIZATION:
+    # Use 2 samples/GPU on 8 GPUs (global batch 16) to retain safe memory
+    # headroom for heavy CBGS + multimodal GT-sampling batches.
+    BATCH_SIZE_PER_GPU: 2
+    # Match the reference recipe's total training length.
+    NUM_EPOCHS: 10
+    OPTIMIZER: adam_onecycle
+    # Linearly scale the reference peak LR 1e-3 (global batch 32) to the
+    # current global batch 16.
+    LR: 0.0005
+    # The original isfusion_0075voxel.py recipe does not enable its FP16
+    # optimizer hook.  AMP caused non-finite fusion features near the peak
+    # OneCycle LR, so this reproduction intentionally remains full FP32.
+    USE_AMP: False
+    WEIGHT_DECAY: 0.01
+    BETAS: [0.9, 0.999]
+    # OpenPCDet OneCycle expects [start_momentum, peak_lr_momentum].
+    # This is equivalent to IS-Fusion's cyclic momentum target_ratio:
+    # beta1 starts at 0.9, reaches 0.9 * 0.8947368421 = 0.8052631579
+    # at the LR peak, and returns to 0.9 during the decay phase.
+    MOMS: [0.9, 0.8052631579]
+    PCT_START: 0.4
+    DIV_FACTOR: 10
+    # Retained for optimizer compatibility; frozen Swin parameters are
+    # excluded from optimization.
+    IMAGE_BACKBONE_LR_MULT: 0.1
+    GRAD_NORM_CLIP: 0.01
+    # Equivalent to the original EmptyCacheHook(after_iter=True).
+    EMPTY_CACHE_AFTER_ITER: True
+
+# ObjectSampleV2 and ModalMask3D use stop_epoch=total_epochs-2 in the
+# reference.  Keep image/global geometric augmentation enabled throughout.
+HOOK:
+    DisableAugmentationHook:
+        DISABLE_AUG_LIST: ['gt_sampling', 'isfusion_modal_mask']
+        NUM_LAST_EPOCHS: 2

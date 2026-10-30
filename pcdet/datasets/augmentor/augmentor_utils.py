@@ -71,7 +71,8 @@ def global_rotation(gt_boxes, points, rot_range, return_rot=False, noise_rotatio
     return gt_boxes, points
 
 
-def global_scaling(gt_boxes, points, scale_range, return_scale=False):
+def global_scaling(gt_boxes, points, scale_range, return_scale=False,
+                   noise_scale=None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading]
@@ -81,7 +82,8 @@ def global_scaling(gt_boxes, points, scale_range, return_scale=False):
     """
     if scale_range[1] - scale_range[0] < 1e-3:
         return gt_boxes, points
-    noise_scale = np.random.uniform(scale_range[0], scale_range[1])
+    if noise_scale is None:
+        noise_scale = np.random.uniform(scale_range[0], scale_range[1])
     points[:, :3] *= noise_scale
     gt_boxes[:, :6] *= noise_scale
     if gt_boxes.shape[1] > 7:

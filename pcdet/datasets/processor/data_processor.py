@@ -179,6 +179,54 @@ class DataProcessor(object):
             data_dict['voxel_num_points'] = num_points
         return data_dict
 
+    def mask_points_outside_range_3d_strict(self, data_dict=None, config=None):
+        """Match MMDetection3D ``PointsRangeFilter`` exactly.
+
+        OpenPCDet's standard range mask checks x/y only and includes boundary
+        points.  CCF's ISFusion reference checks x/y/z with strict bounds, so
+        the dedicated processor is required for numerical reproduction.
+        """
+        if data_dict is None:
+            return partial(self.mask_points_outside_range_3d_strict, config=config)
+
+        points = data_dict['points']
+        limit = self.point_cloud_range
+        mask = (
+            (points[:, 0] > limit[0]) & (points[:, 0] < limit[3]) &
+            (points[:, 1] > limit[1]) & (points[:, 1] < limit[4]) &
+            (points[:, 2] > limit[2]) & (points[:, 2] < limit[5])
+        )
+        data_dict['points'] = points[mask]
+        return data_dict
+
+    def mask_boxes_outside_range_bev_strict(self, data_dict=None, config=None):
+        """Match MMDetection3D ``ObjectRangeFilter`` for LiDAR boxes.
+
+        The reference operator checks only the BEV centre and uses strict
+        bounds.  OpenPCDet's generic range processor also checks z when
+        ``USE_CENTER_TO_FILTER`` is enabled, so it is not equivalent here.
+        """
+        if data_dict is None:
+            return partial(
+                self.mask_boxes_outside_range_bev_strict, config=config
+            )
+
+        boxes = data_dict.get('gt_boxes', None)
+        if boxes is None or not self.training:
+            return data_dict
+
+        limit = self.point_cloud_range
+        mask = (
+            (boxes[:, 0] > limit[0]) & (boxes[:, 0] < limit[3]) &
+            (boxes[:, 1] > limit[1]) & (boxes[:, 1] < limit[4])
+        )
+        data_dict['gt_boxes'] = boxes[mask]
+        if data_dict.get('gt_names', None) is not None:
+            data_dict['gt_names'] = data_dict['gt_names'][mask]
+        if data_dict.get('gt_boxes2d', None) is not None:
+            data_dict['gt_boxes2d'] = data_dict['gt_boxes2d'][mask]
+        return data_dict
+
     def sample_points(self, data_dict=None, config=None):
         if data_dict is None:
             return partial(self.sample_points, config=config)
@@ -233,6 +281,23 @@ class DataProcessor(object):
     def image_normalize(self, data_dict=None, config=None):
         if data_dict is None:
             return partial(self.image_normalize, config=config)
+        if config.get('CCF_COMPATIBLE', False):
+            import mmcv
+
+            mean = np.asarray(config.mean, dtype=np.float32)
+            std = np.asarray(config.std, dtype=np.float32)
+            data_dict["camera_imgs"] = [
+                torch.from_numpy(
+                    mmcv.imnormalize(
+                        np.asarray(image, dtype=np.float32),
+                        mean,
+                        std,
+                        to_rgb=True,
+                    ).transpose(2, 0, 1).copy()
+                )
+                for image in data_dict["camera_imgs"]
+            ]
+            return data_dict
         mean = config.mean
         std = config.std
         compose = torchvision.transforms.Compose(
@@ -249,6 +314,9 @@ class DataProcessor(object):
             return partial(self.image_calibrate, config=config)
         img_process_infos = data_dict['img_process_infos']
         transforms = []
+        ccf_compatible = config.get('CCF_COMPATIBLE', False)
+        ccf_lidar2image = []
+        ccf_intrinsics = []
         for img_process_info in img_process_infos:
             resize, crop, flip, rotate = img_process_info
 
@@ -277,6 +345,26 @@ class DataProcessor(object):
             transform[:2, :2] = rotation
             transform[:2, 3] = translation
             transforms.append(transform.numpy())
+        if ccf_compatible:
+            # CCF applies the 3x3 image homography to its float64 intrinsics,
+            # then multiplies by the float32 extrinsics, and casts only in the
+            # final formatting bundle.  Reproduce that operation order rather
+            # than applying OpenPCDet's post-projection 4x4 transform.
+            for intrinsic, extrinsic, transform in zip(
+                    data_dict['camera_intrinsics'],
+                    data_dict['lidar2camera'], transforms):
+                ida_mat = torch.from_numpy(transform[:3, :3]).float()
+                ida_mat[:, 2] += torch.from_numpy(transform[:3, 3]).float()
+                augmented_intrinsic = intrinsic.copy()
+                augmented_intrinsic[:3, :3] = (
+                    ida_mat @ intrinsic[:3, :3]
+                ).numpy()
+                ccf_intrinsics.append(augmented_intrinsic)
+                ccf_lidar2image.append(augmented_intrinsic @ extrinsic)
+
+            data_dict['camera_intrinsics'] = ccf_intrinsics
+            data_dict['lidar2image'] = ccf_lidar2image
+            transforms = [np.eye(4, dtype=np.float32) for _ in transforms]
         data_dict["img_aug_matrix"] = transforms
         return data_dict
 

@@ -1,0 +1,14 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf.yaml
+
+# Fifteen-epoch formal recipe: 8 GPUs x 3 samples/GPU = global batch 24.
+# Scale the OneCycle peak LR linearly from 5e-4 at global batch 16:
+# 5e-4 * 24 / 16 = 7.5e-4.
+MODEL:
+    PILLAR_SAMPLER:
+        NUM_POINTS_IN_PILLAR: 20
+
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 3
+    NUM_EPOCHS: 15
+    LR: 0.00075
+

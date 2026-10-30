@@ -43,6 +43,62 @@ class NuScenesDataset(DatasetTemplate):
                 nuscenes_infos.extend(infos)
 
         self.infos.extend(nuscenes_infos)
+        if self.dataset_cfg.get('CCF_COMPATIBLE_SWEEPS', False):
+            split_dir = (self.root_path / self.dataset_cfg.CCF_SPLIT_DIR).resolve()
+            canonical_name = self.dataset_cfg.get(
+                'CCF_CANONICAL_TRAIN_INFO', Path(info_path).name
+            ) if mode == 'train' else self.dataset_cfg.get(
+                'CCF_CANONICAL_TEST_INFO', Path(info_path).name
+            )
+            # Generated OpenPCDet infos may carry a sweep-layout suffix while
+            # the canonical CCF split keeps its original filename. Geometry
+            # is still matched strictly by sample token below.
+            canonical_name = str(canonical_name).replace('_10history', '')
+            canonical_path = split_dir / canonical_name
+            with open(canonical_path, 'rb') as f:
+                canonical_payload = pickle.load(f)
+            canonical_infos = (
+                canonical_payload['infos']
+                if isinstance(canonical_payload, dict)
+                else canonical_payload
+            )
+            canonical_by_token = {
+                record['token']: record for record in canonical_infos
+            }
+            for record in nuscenes_infos:
+                canonical = canonical_by_token.get(record['token'])
+                if canonical is None:
+                    raise KeyError(
+                        f"{record['token']} is missing from {canonical_path}"
+                    )
+                current_time = canonical['timestamp'] / 1e6
+                converted_sweeps = []
+                for sweep in canonical['sweeps']:
+                    transform = np.eye(4, dtype=np.float32)
+                    transform[:3, :3] = sweep['sensor2lidar_rotation']
+                    transform[:3, 3] = sweep['sensor2lidar_translation']
+                    lidar_path = str(sweep['data_path'])
+                    for prefix in ('./data/nuscenes/', 'data/nuscenes/'):
+                        if lidar_path.startswith(prefix):
+                            lidar_path = lidar_path[len(prefix):]
+                            break
+                    converted_sweeps.append({
+                        'lidar_path': lidar_path,
+                        'transform_matrix': transform,
+                        'sensor2lidar_rotation': sweep['sensor2lidar_rotation'],
+                        'sensor2lidar_translation': sweep['sensor2lidar_translation'],
+                        'time_lag': current_time - sweep['timestamp'] / 1e6,
+                    })
+                record['sweeps'] = converted_sweeps
+                for camera_name, camera in record.get('cams', {}).items():
+                    canonical_camera = canonical['cams'][camera_name]
+                    camera['sensor2lidar_rotation'] = canonical_camera[
+                        'sensor2lidar_rotation'
+                    ]
+                    camera['sensor2lidar_translation'] = canonical_camera[
+                        'sensor2lidar_translation'
+                    ]
+                    camera['camera_intrinsics'] = canonical_camera['cam_intrinsic']
         self.logger.info('Total samples for NuScenes dataset: %d' % (len(nuscenes_infos)))
 
     def balanced_infos_resampling(self, infos):
@@ -89,13 +145,26 @@ class NuScenesDataset(DatasetTemplate):
 
         lidar_path = self.root_path / sweep_info['lidar_path']
         points_sweep = np.fromfile(str(lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
-        points_sweep = remove_ego_points(points_sweep).T
-        if sweep_info['transform_matrix'] is not None:
+        ccf_compatible = self.dataset_cfg.get('CCF_COMPATIBLE_SWEEPS', False)
+        if not ccf_compatible:
+            points_sweep = remove_ego_points(points_sweep)
+        if ccf_compatible:
+            # Match MMDetection3D's two float32 assignments exactly.  A
+            # single homogeneous transform changes rounding at ~1e-6.
+            points_sweep[:, :3] = points_sweep[:, :3] @ sweep_info[
+                'sensor2lidar_rotation'
+            ].T
+            points_sweep[:, :3] += sweep_info['sensor2lidar_translation']
+            points_sweep = points_sweep.T
+        else:
+            points_sweep = points_sweep.T
+        if not ccf_compatible and sweep_info['transform_matrix'] is not None:
             num_points = points_sweep.shape[1]
             points_sweep[:3, :] = sweep_info['transform_matrix'].dot(
                 np.vstack((points_sweep[:3, :], np.ones(num_points))))[:3, :]
 
-        cur_times = sweep_info['time_lag'] * np.ones((1, points_sweep.shape[1]))
+        cur_times = sweep_info['time_lag'] * np.ones(
+            (1, points_sweep.shape[1]), dtype=points_sweep.dtype)
         return points_sweep.T, cur_times.T
 
     def get_lidar_with_sweeps(self, index, max_sweeps=1):
@@ -104,9 +173,15 @@ class NuScenesDataset(DatasetTemplate):
         points = np.fromfile(str(lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
 
         sweep_points_list = [points]
-        sweep_times_list = [np.zeros((points.shape[0], 1))]
+        sweep_times_list = [np.zeros((points.shape[0], 1), dtype=points.dtype)]
 
-        for k in np.random.choice(len(info['sweeps']), max_sweeps - 1, replace=False):
+        sweep_count = min(len(info['sweeps']), max_sweeps - 1)
+        if self.dataset_cfg.get('CCF_COMPATIBLE_SWEEPS', False):
+            sweep_indices = range(sweep_count)
+        else:
+            sweep_indices = np.random.choice(
+                len(info['sweeps']), sweep_count, replace=False)
+        for k in sweep_indices:
             points_sweep, times_sweep = self.get_sweep(info['sweeps'][k])
             sweep_points_list.append(points_sweep)
             sweep_times_list.append(times_sweep)
@@ -160,26 +235,48 @@ class NuScenesDataset(DatasetTemplate):
         input_dict["camera_intrinsics"] = []
         input_dict["camera2lidar"] = []
 
+        ccf_compatible_calibration = self.camera_config.get(
+            'CCF_COMPATIBLE_CALIBRATION', False)
+
         for _, camera_info in info["cams"].items():
             input_dict["image_paths"].append(camera_info["data_path"])
 
             # lidar to camera transform
-            lidar2camera_r = np.linalg.inv(camera_info["sensor2lidar_rotation"])
-            lidar2camera_t = (
-                camera_info["sensor2lidar_translation"] @ lidar2camera_r.T
-            )
-            lidar2camera_rt = np.eye(4).astype(np.float32)
-            lidar2camera_rt[:3, :3] = lidar2camera_r.T
-            lidar2camera_rt[3, :3] = -lidar2camera_t
-            input_dict["lidar2camera"].append(lidar2camera_rt.T)
+            if ccf_compatible_calibration:
+                camera2lidar = np.eye(4, dtype=np.float32)
+                camera2lidar[:3, :3] = camera_info["sensor2lidar_rotation"]
+                camera2lidar[:3, 3] = camera_info["sensor2lidar_translation"]
+                lidar2camera = np.zeros((4, 4), dtype=np.float32)
+                rotation = camera2lidar[:3, :3]
+                translation = camera2lidar[:3, 3]
+                lidar2camera[:3, :3] = rotation.T
+                lidar2camera[:3, 3] = -rotation.T @ translation
+                lidar2camera[3, 3] = 1.0
+                input_dict["lidar2camera"].append(lidar2camera)
+            else:
+                lidar2camera_r = np.linalg.inv(camera_info["sensor2lidar_rotation"])
+                lidar2camera_t = (
+                    camera_info["sensor2lidar_translation"] @ lidar2camera_r.T
+                )
+                lidar2camera_rt = np.eye(4).astype(np.float32)
+                lidar2camera_rt[:3, :3] = lidar2camera_r.T
+                lidar2camera_rt[3, :3] = -lidar2camera_t
+                lidar2camera = lidar2camera_rt.T
+                input_dict["lidar2camera"].append(lidar2camera)
 
             # camera intrinsics
-            camera_intrinsics = np.eye(4).astype(np.float32)
+            # CCF constructs ``viewpad`` with NumPy's default float64 dtype
+            # and only casts to float32 in its final formatting bundle.
+            # Preserve that order for strict cross-framework comparison.
+            camera_intrinsics = (
+                np.eye(4) if ccf_compatible_calibration
+                else np.eye(4).astype(np.float32)
+            )
             camera_intrinsics[:3, :3] = camera_info["camera_intrinsics"]
             input_dict["camera_intrinsics"].append(camera_intrinsics)
 
             # lidar to image transform
-            lidar2image = camera_intrinsics @ lidar2camera_rt.T
+            lidar2image = camera_intrinsics @ lidar2camera
             input_dict["lidar2image"].append(lidar2image)
 
             # camera to ego transform
@@ -198,14 +295,36 @@ class NuScenesDataset(DatasetTemplate):
         # read image
         filename = input_dict["image_paths"]
         images = []
+        ccf_compatible_io = self.camera_config.get('CCF_COMPATIBLE_IMAGE_IO', False)
         for name in filename:
-            images.append(Image.open(str(self.root_path / name)))
+            image_path = str(self.root_path / name)
+            if ccf_compatible_io:
+                # CCF decodes JPEG through OpenCV/MMCV (BGR), resizes with
+                # PIL, then converts BGR to RGB during normalization.  PIL's
+                # direct JPEG decoder differs by a few intensity levels, which
+                # is enough to perturb exact checkpoint comparisons.
+                import cv2
+                image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                if image is None:
+                    raise FileNotFoundError(image_path)
+                images.append(Image.fromarray(image))
+            else:
+                images.append(Image.open(image_path))
         
         input_dict["camera_imgs"] = images
         input_dict["ori_shape"] = images[0].size
         
         # resize and crop image
         input_dict = self.crop_image(input_dict)
+
+        if (ccf_compatible_io and not self.camera_config.get(
+                'CCF_COMPATIBLE_NORMALIZATION', False)):
+            # Equivalent to mmcv.imnormalize(..., to_rgb=True), performed
+            # before OpenPCDet's torchvision normalization.
+            input_dict['camera_imgs'] = [
+                Image.fromarray(np.asarray(image)[..., ::-1].copy())
+                for image in input_dict['camera_imgs']
+            ]
 
         return input_dict
 
@@ -238,6 +357,11 @@ class NuScenesDataset(DatasetTemplate):
                 'gt_names': info['gt_names'] if mask is None else info['gt_names'][mask],
                 'gt_boxes': info['gt_boxes'] if mask is None else info['gt_boxes'][mask]
             })
+            if 'gt_boxes_2d' in info:
+                input_dict['_gt_boxes2d_for_sampling'] = (
+                    info['gt_boxes_2d'] if mask is None
+                    else info['gt_boxes_2d'][mask]
+                )
         if self.use_camera:
             input_dict = self.load_camera_info(input_dict, info)
 

@@ -44,7 +44,12 @@ class LRSchedulerStep(object):
     def step(self, step, epoch=None):
         for start, end, func in self.lr_phases:
             if step >= start:
-                self.optimizer.lr = func((step - start) / (end - start))
+                lr = func((step - start) / (end - start))
+                lr_multipliers = getattr(self, 'lr_multipliers', None)
+                if lr_multipliers is None:
+                    self.optimizer.lr = lr
+                else:
+                    self.optimizer.lr = [lr * multiplier for multiplier in lr_multipliers]
         for start, end, func in self.mom_phases:
             if step >= start:
                 self.optimizer.mom = func((step - start) / (end - start))
@@ -59,11 +64,12 @@ def annealing_cos(start, end, pct):
 
 class OneCycle(LRSchedulerStep):
     def __init__(self, fai_optimizer, total_step, lr_max, moms, div_factor,
-                 pct_start):
+                 pct_start, lr_multipliers=None):
         self.lr_max = lr_max
         self.moms = moms
         self.div_factor = div_factor
         self.pct_start = pct_start
+        self.lr_multipliers = lr_multipliers
         a1 = int(total_step * self.pct_start)
         a2 = total_step - a1
         low_lr = self.lr_max / self.div_factor
@@ -73,7 +79,11 @@ class OneCycle(LRSchedulerStep):
         mom_phases = ((0, partial(annealing_cos, *self.moms)),
                       (self.pct_start, partial(annealing_cos,
                                                *self.moms[::-1])))
-        fai_optimizer.lr, fai_optimizer.mom = low_lr, self.moms[0]
+        if self.lr_multipliers is None:
+            fai_optimizer.lr = low_lr
+        else:
+            fai_optimizer.lr = [low_lr * multiplier for multiplier in self.lr_multipliers]
+        fai_optimizer.mom = self.moms[0]
         super().__init__(fai_optimizer, total_step, lr_phases, mom_phases)
 
 

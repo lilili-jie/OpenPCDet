@@ -271,7 +271,12 @@ class TransFusionHead(nn.Module):
         else:
             vel = None
 
-        boxes_dict = self.decode_bbox(score, rot, dim, center, height, vel)
+        # Assignment may require a different box convention from final
+        # post-processing.  The stock head uses the same convention for both,
+        # while checkpoint-compatible heads can override this hook.
+        boxes_dict = self.decode_bbox_for_assignment(
+            score, rot, dim, center, height, vel
+        )
         bboxes_tensor = boxes_dict[0]["pred_boxes"]
         gt_bboxes_tensor = gt_bboxes_3d.to(score.device)
 
@@ -333,7 +338,10 @@ class TransFusionHead(nn.Module):
 
                 center = torch.tensor([coor_x, coor_y], dtype=torch.float32, device=device)
                 center_int = center.to(torch.int32)
-                centernet_utils.draw_gaussian_to_heatmap(heatmap[gt_labels_3d[idx]], center_int, radius)
+                center_int = self.format_heatmap_center(center_int)
+                centernet_utils.draw_gaussian_to_heatmap(
+                    heatmap[gt_labels_3d[idx]], center_int, radius
+                )
 
 
         mean_iou = ious[pos_inds].sum() / max(len(pos_inds), 1)
@@ -393,6 +401,14 @@ class TransFusionHead(nn.Module):
         if code_size == 10:
             targets[:, 8:10] = bboxes[:, 7:]
         return targets
+
+    def decode_bbox_for_assignment(self, heatmap, rot, dim, center, height, vel):
+        """Decode boxes in the convention expected by the target assigner."""
+        return self.decode_bbox(heatmap, rot, dim, center, height, vel)
+
+    def format_heatmap_center(self, center_int):
+        """Map an ``(x, y)`` target center to heatmap tensor coordinates."""
+        return center_int
 
     def decode_bbox(self, heatmap, rot, dim, center, height, vel, filter=False):
         

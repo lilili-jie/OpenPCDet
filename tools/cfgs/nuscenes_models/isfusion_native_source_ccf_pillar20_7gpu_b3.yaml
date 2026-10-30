@@ -1,0 +1,11 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf.yaml
+
+# Seven-GPU formal recipe: 7 GPUs x 3 samples/GPU = global batch 21.
+# The peak LR is linearly scaled from 5e-4 at global batch 16.
+MODEL:
+    PILLAR_SAMPLER:
+        NUM_POINTS_IN_PILLAR: 20
+
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 3
+    LR: 0.00065625

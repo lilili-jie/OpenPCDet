@@ -42,7 +42,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         lr_scheduler.step(accumulated_iter, cur_epoch)
 
         try:
-            cur_lr = float(optimizer.lr)
+            cur_lr = max(optimizer._lr) if hasattr(optimizer, '_lr') else float(optimizer.lr)
         except:
             cur_lr = optimizer.param_groups[0]['lr']
 
@@ -60,6 +60,10 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
         scaler.step(optimizer)
         scaler.update()
+        if optim_cfg.get('EMPTY_CACHE_AFTER_ITER', False):
+            # IS-Fusion's official runtime uses EmptyCacheHook(after_iter=True)
+            # because the full camera branch runs close to GPU memory capacity.
+            torch.cuda.empty_cache()
 
         accumulated_iter += 1
  

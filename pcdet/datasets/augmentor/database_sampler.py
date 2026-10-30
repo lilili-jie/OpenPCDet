@@ -2,11 +2,14 @@ import pickle
 
 import os
 import copy
+from pathlib import Path
 import numpy as np
 from skimage import io
 import torch
 import SharedArray
 import torch.distributed as dist
+import cv2
+from PIL import Image
 
 from ...ops.iou3d_nms import iou3d_nms_utils
 from ...utils import box_utils, common_utils, calibration_kitti
@@ -20,6 +23,17 @@ class DataBaseSampler(object):
 
         self.img_aug_type = sampler_cfg.get('IMG_AUG_TYPE', None)
         self.img_aug_iou_thresh = sampler_cfg.get('IMG_AUG_IOU_THRESH', 0.5)
+        self.source_multimodal = sampler_cfg.get('SOURCE_MULTIMODAL', False)
+        self.multimodal_mixup = float(sampler_cfg.get('MIXUP', 0.7))
+        self.source_check_2d_collision = sampler_cfg.get(
+            'CHECK_2D_COLLISION', False
+        )
+        self.source_collision_thresholds = sampler_cfg.get(
+            'COLLISION_THR', [0.0]
+        )
+        self.source_collision_in_classes = bool(
+            sampler_cfg.get('COLLISION_IN_CLASSES', False)
+        )
 
         self.logger = logger
         self.db_infos = {}
@@ -366,6 +380,11 @@ class DataBaseSampler(object):
         gt_boxes_mask = data_dict['gt_boxes_mask']
         gt_boxes = data_dict['gt_boxes'][gt_boxes_mask]
         gt_names = data_dict['gt_names'][gt_boxes_mask]
+        original_boxes2d = data_dict.get('_gt_boxes2d_for_sampling', None)
+        if original_boxes2d is None:
+            original_boxes2d = np.zeros((0, 5), dtype=np.float32)
+        else:
+            original_boxes2d = np.asarray(original_boxes2d)[gt_boxes_mask]
         points = data_dict['points']
         if self.sampler_cfg.get('USE_ROAD_PLANE', False) and mv_height is None:
             sampled_gt_boxes, mv_height = self.put_boxes_on_road_planes(
@@ -437,9 +456,197 @@ class DataBaseSampler(object):
         data_dict['gt_names'] = gt_names
         data_dict['points'] = points
 
+        if self.source_multimodal:
+            data_dict = self.paste_source_multimodal_patches(
+                data_dict, total_valid_sampled_dict,
+                original_boxes3d=gt_boxes,
+                original_boxes2d=original_boxes2d,
+            )
+
         if self.img_aug_type is not None:
             data_dict = self.copy_paste_to_image(img_aug_gt_dict, data_dict, points)
 
+        return data_dict
+
+    @staticmethod
+    def _sequential_valid_indices(collision_matrix, num_existing):
+        """Reproduce MMDataBaseSamplerV2's ordered collision resolution.
+
+        A rejected candidate is removed from the collision matrix so a later
+        candidate that collided only with it can still be retained.
+        """
+        collision_matrix = np.asarray(collision_matrix, dtype=np.bool_).copy()
+        valid = []
+        for index in range(num_existing, collision_matrix.shape[0]):
+            if collision_matrix[index].any():
+                collision_matrix[index, :] = False
+                collision_matrix[:, index] = False
+            else:
+                valid.append(index - num_existing)
+        return np.asarray(valid, dtype=np.int64)
+
+    def _source_multimodal_valid_indices(
+            self, sampled_dict, avoid_boxes3d, avoid_boxes2d):
+        """Apply the reference sampler's combined 3-D/2-D collision test."""
+        sampled_boxes3d = np.stack([
+            record['box3d_lidar'] for record in sampled_dict
+        ], axis=0).astype(np.float32)
+        sampled_boxes2d = np.stack([
+            record['box2d_camera'] for record in sampled_dict
+        ], axis=0).astype(np.float32)
+
+        avoid_boxes3d = np.asarray(avoid_boxes3d, dtype=np.float32)
+        avoid_boxes2d = np.asarray(avoid_boxes2d, dtype=np.float32)
+        total_boxes3d = np.concatenate(
+            [avoid_boxes3d[:, :7], sampled_boxes3d[:, :7]], axis=0
+        )
+        total_boxes2d = np.concatenate(
+            [avoid_boxes2d, sampled_boxes2d], axis=0
+        )
+
+        # Positive rotated BEV IoU is equivalent to polygon overlap for the
+        # non-degenerate nuScenes boxes used by the reference collision test.
+        collision = iou3d_nms_utils.boxes_bev_iou_cpu(
+            total_boxes3d, total_boxes3d
+        ) > 0.0
+
+        if self.source_check_2d_collision:
+            threshold = self.source_collision_thresholds
+            if isinstance(threshold, (list, tuple)):
+                threshold = float(np.random.choice(threshold))
+            else:
+                threshold = float(threshold)
+
+            left = np.maximum(total_boxes2d[:, None, 0],
+                              total_boxes2d[None, :, 0])
+            top = np.maximum(total_boxes2d[:, None, 1],
+                             total_boxes2d[None, :, 1])
+            right = np.minimum(total_boxes2d[:, None, 2],
+                               total_boxes2d[None, :, 2])
+            bottom = np.minimum(total_boxes2d[:, None, 3],
+                                total_boxes2d[None, :, 3])
+            intersection = np.maximum(0.0, right - left) * np.maximum(
+                0.0, bottom - top
+            )
+            if threshold == 0.0:
+                collision_2d = intersection > 0.0
+            else:
+                # Reference iou_jit(..., mode='iof') divides each row by the
+                # area of that row's foreground box.
+                area = np.maximum(
+                    1e-6,
+                    (total_boxes2d[:, 2] - total_boxes2d[:, 0]) *
+                    (total_boxes2d[:, 3] - total_boxes2d[:, 1]),
+                )
+                collision_2d = intersection / area[:, None] > threshold
+            collision |= collision_2d
+
+        np.fill_diagonal(collision, False)
+        return self._sequential_valid_indices(
+            collision, len(avoid_boxes3d)
+        ), sampled_boxes3d
+
+    @staticmethod
+    def _transform_source_box2d(box2d, process_info, image_shape):
+        resize, crop, _, _ = process_info
+        x1, y1, x2, y2 = np.asarray(box2d, dtype=np.float32)[:4]
+        x1 = int(np.floor(x1 * resize - crop[0]))
+        y1 = int(np.floor(y1 * resize - crop[1]))
+        x2 = int(np.ceil(x2 * resize - crop[0]))
+        y2 = int(np.ceil(y2 * resize - crop[1]))
+        height, width = image_shape[:2]
+        clipped = (
+            max(0, x1), max(0, y1), min(width, x2), min(height, y2)
+        )
+        return (x1, y1, x2, y2), clipped
+
+    def paste_source_multimodal_patches(
+            self, data_dict, sampled_records, original_boxes3d,
+            original_boxes2d):
+        """Paste Source-only GT image crops into the matching camera view.
+
+        Camera images have already undergone resize/crop in this OpenPCDet
+        pipeline, so the stored original-resolution box is transformed by the
+        target sample's per-view resize/crop parameters before blending.
+        """
+        images = data_dict['camera_imgs']
+        origin_images = [np.asarray(image).copy() for image in images]
+        process_infos = data_dict['img_process_infos']
+        pasted = 0
+        events = []
+        for box3d, box2d in zip(original_boxes3d, original_boxes2d):
+            events.append((float(box3d[0]), False, box2d, None))
+        for record in sampled_records:
+            events.append((float(record['box3d_lidar'][0]), True,
+                           record['box2d_camera'], record))
+
+        # Same far-to-near order as np.argsort(-all_bboxes_3d[:, 0]) in the
+        # reference implementation.  Real objects participate so their
+        # original pixels can restore foreground occlusion after GT pasting.
+        for _, is_sampled, raw_box2d, record in sorted(
+                events, key=lambda item: -item[0]):
+            box2d = np.asarray(raw_box2d, dtype=np.float32)
+            camera_index = int(box2d[4])
+            if camera_index < 0 or camera_index >= len(images):
+                continue
+            target = np.asarray(images[camera_index]).copy()
+            (x1, y1, x2, y2), clipped = self._transform_source_box2d(
+                box2d, process_infos[camera_index], target.shape
+            )
+            clipped_x1, clipped_y1, clipped_x2, clipped_y2 = clipped
+            if clipped_x2 <= clipped_x1 or clipped_y2 <= clipped_y1:
+                continue
+
+            if not is_sampled:
+                original = origin_images[camera_index]
+                current_region = target[
+                    clipped_y1:clipped_y2, clipped_x1:clipped_x2
+                ].astype(np.float32)
+                original_region = original[
+                    clipped_y1:clipped_y2, clipped_x1:clipped_x2
+                ].astype(np.float32)
+                restored = self.multimodal_mixup * original_region
+                restored += (1.0 - self.multimodal_mixup) * current_region
+                target[clipped_y1:clipped_y2,
+                       clipped_x1:clipped_x2] = np.clip(
+                    restored, 0, 255
+                ).astype(np.uint8)
+                images[camera_index] = Image.fromarray(target)
+                continue
+
+            patch_path = Path(record['image_path'])
+            if not patch_path.is_absolute():
+                patch_path = self.root_path / patch_path
+            patch = cv2.imread(str(patch_path), cv2.IMREAD_COLOR)
+            if patch is None:
+                raise FileNotFoundError(patch_path)
+
+            full_width, full_height = max(1, x2 - x1), max(1, y2 - y1)
+            patch = cv2.resize(
+                patch, (full_width, full_height), interpolation=cv2.INTER_LINEAR
+            )
+            patch = patch[
+                clipped_y1 - y1:clipped_y2 - y1,
+                clipped_x1 - x1:clipped_x2 - x1,
+            ]
+            region = target[clipped_y1:clipped_y2, clipped_x1:clipped_x2]
+            paste_height, paste_width = region.shape[:2]
+            mask = np.zeros((paste_height, paste_width), dtype=np.float32)
+            margin_h, margin_w = int(0.05 * paste_height), int(0.05 * paste_width)
+            mask[margin_h:paste_height - margin_h or paste_height,
+                 margin_w:paste_width - margin_w or paste_width] = 1.0
+            alpha = mask[..., None] * self.multimodal_mixup
+            blended = region.astype(np.float32) * (1.0 - alpha)
+            blended += patch.astype(np.float32) * alpha
+            target[clipped_y1:clipped_y2, clipped_x1:clipped_x2] = np.clip(
+                blended, 0, 255
+            ).astype(np.uint8)
+            images[camera_index] = Image.fromarray(target)
+            pasted += 1
+        data_dict['camera_imgs'] = images
+        data_dict['multimodal_patches_pasted'] = np.asarray(
+            pasted, dtype=np.int64
+        )
         return data_dict
 
     def __call__(self, data_dict):
@@ -453,8 +660,14 @@ class DataBaseSampler(object):
         """
         gt_boxes = data_dict['gt_boxes']
         gt_names = data_dict['gt_names'].astype(str)
-        existed_boxes = gt_boxes
+        original_boxes = gt_boxes
+        original_boxes2d = data_dict.get('_gt_boxes2d_for_sampling', None)
+        if original_boxes2d is None:
+            original_boxes2d = np.zeros((0, 5), dtype=np.float32)
+        avoid_boxes = original_boxes
+        avoid_boxes2d = original_boxes2d
         total_valid_sampled_dict = []
+        total_valid_sampled_boxes = []
         sampled_mv_height = []
         sampled_gt_boxes2d = []
 
@@ -465,15 +678,30 @@ class DataBaseSampler(object):
             if int(sample_group['sample_num']) > 0:
                 sampled_dict = self.sample_with_fixed_number(class_name, sample_group)
 
-                sampled_boxes = np.stack([x['box3d_lidar'] for x in sampled_dict], axis=0).astype(np.float32)
-
                 assert not self.sampler_cfg.get('DATABASE_WITH_FAKELIDAR', False), 'Please use latest codes to generate GT_DATABASE'
-
-                iou1 = iou3d_nms_utils.boxes_bev_iou_cpu(sampled_boxes[:, 0:7], existed_boxes[:, 0:7])
-                iou2 = iou3d_nms_utils.boxes_bev_iou_cpu(sampled_boxes[:, 0:7], sampled_boxes[:, 0:7])
-                iou2[range(sampled_boxes.shape[0]), range(sampled_boxes.shape[0])] = 0
-                iou1 = iou1 if iou1.shape[1] > 0 else iou2
-                valid_mask = ((iou1.max(axis=1) + iou2.max(axis=1)) == 0)
+                if self.source_multimodal:
+                    valid_indices, sampled_boxes = (
+                        self._source_multimodal_valid_indices(
+                            sampled_dict, avoid_boxes, avoid_boxes2d
+                        )
+                    )
+                    valid_mask = np.zeros(len(sampled_dict), dtype=np.bool_)
+                    valid_mask[valid_indices] = True
+                else:
+                    sampled_boxes = np.stack([
+                        x['box3d_lidar'] for x in sampled_dict
+                    ], axis=0).astype(np.float32)
+                    iou1 = iou3d_nms_utils.boxes_bev_iou_cpu(
+                        sampled_boxes[:, 0:7], avoid_boxes[:, 0:7]
+                    )
+                    iou2 = iou3d_nms_utils.boxes_bev_iou_cpu(
+                        sampled_boxes[:, 0:7], sampled_boxes[:, 0:7]
+                    )
+                    np.fill_diagonal(iou2, 0)
+                    iou1 = iou1 if iou1.shape[1] > 0 else iou2
+                    valid_mask = (
+                        (iou1.max(axis=1) + iou2.max(axis=1)) == 0
+                    )
 
                 if self.img_aug_type is not None:
                     sampled_boxes2d, mv_height, valid_mask = self.sample_gt_boxes_2d(data_dict, sampled_boxes, valid_mask)
@@ -485,10 +713,28 @@ class DataBaseSampler(object):
                 valid_sampled_dict = [sampled_dict[x] for x in valid_mask]
                 valid_sampled_boxes = sampled_boxes[valid_mask]
 
-                existed_boxes = np.concatenate((existed_boxes, valid_sampled_boxes[:, :existed_boxes.shape[-1]]), axis=0)
                 total_valid_sampled_dict.extend(valid_sampled_dict)
+                total_valid_sampled_boxes.append(
+                    valid_sampled_boxes[:, :original_boxes.shape[-1]]
+                )
+                if (self.source_multimodal and self.source_collision_in_classes
+                        and valid_sampled_dict):
+                    avoid_boxes = np.concatenate(
+                        [avoid_boxes, valid_sampled_boxes[:, :avoid_boxes.shape[-1]]],
+                        axis=0,
+                    )
+                    new_boxes2d = np.stack([
+                        record['box2d_camera'] for record in valid_sampled_dict
+                    ], axis=0)
+                    avoid_boxes2d = np.concatenate(
+                        [avoid_boxes2d, new_boxes2d], axis=0
+                    )
 
-        sampled_gt_boxes = existed_boxes[gt_boxes.shape[0]:, :]
+        sampled_gt_boxes = (
+            np.concatenate(total_valid_sampled_boxes, axis=0)
+            if total_valid_sampled_boxes
+            else np.zeros((0, original_boxes.shape[-1]), dtype=np.float32)
+        )
 
         if total_valid_sampled_dict.__len__() > 0:
             sampled_gt_boxes2d = np.concatenate(sampled_gt_boxes2d, axis=0) if len(sampled_gt_boxes2d) > 0 else None
@@ -499,4 +745,5 @@ class DataBaseSampler(object):
             )
 
         data_dict.pop('gt_boxes_mask')
+        data_dict.pop('_gt_boxes2d_for_sampling', None)
         return data_dict
