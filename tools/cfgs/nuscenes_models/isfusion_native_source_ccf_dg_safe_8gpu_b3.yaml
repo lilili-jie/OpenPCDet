@@ -1,0 +1,37 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf.yaml
+
+# Strict Source-only DG recipe selected by the controlled 400-step audit.
+# Multimodal GT sampling and ModalMask are omitted. Image preprocessing is
+# deterministic, while correctly composed LiDAR global geometry and BEV flips
+# remain enabled (the validated G2 arm).
+DATA_CONFIG:
+    DATA_AUGMENTOR:
+        DISABLE_AUG_LIST: ['placeholder']
+        AUG_CONFIG_LIST:
+            - NAME: imgaug
+              REFERENCE_IMAGE_AUG_3D: True
+              FINAL_DIM: [384, 1056]
+              RESIZE_LIM: [0.72, 0.72]
+              BOT_PCT_LIM: [0.0, 0.0]
+              ROT_LIM: [0.0, 0.0]
+              RAND_FLIP: False
+
+            - NAME: isfusion_global_transform
+              ROT_LIM: [-0.78539816, 0.78539816]
+              SCALE_LIM: [0.9, 1.1]
+              TRANS_STD: 0.5
+
+            - NAME: random_world_flip
+              ALONG_AXIS_LIST: ['x', 'y']
+
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 3
+    # Base LR 5e-4 at global batch 16, linearly scaled to 8 x 3 = 24.
+    LR: 0.00075
+
+# The two omitted augmentors cannot be re-enabled or disabled by the epoch
+# hook, so make the no-op explicit.
+HOOK:
+    DisableAugmentationHook:
+        DISABLE_AUG_LIST: ['placeholder']
+        NUM_LAST_EPOCHS: 0

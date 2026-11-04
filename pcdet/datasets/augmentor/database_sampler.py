@@ -34,6 +34,9 @@ class DataBaseSampler(object):
         self.source_collision_in_classes = bool(
             sampler_cfg.get('COLLISION_IN_CLASSES', False)
         )
+        self.reference_paste_order = bool(
+            sampler_cfg.get('REFERENCE_PASTE_ORDER', False)
+        )
 
         self.logger = logger
         self.db_infos = {}
@@ -569,6 +572,12 @@ class DataBaseSampler(object):
         pipeline, so the stored original-resolution box is transformed by the
         target sample's per-view resize/crop parameters before blending.
         """
+        if self.reference_paste_order:
+            return self.paste_source_multimodal_patches_reference(
+                data_dict, sampled_records, original_boxes3d,
+                original_boxes2d,
+            )
+
         images = data_dict['camera_imgs']
         origin_images = [np.asarray(image).copy() for image in images]
         process_infos = data_dict['img_process_infos']
@@ -643,6 +652,119 @@ class DataBaseSampler(object):
             ).astype(np.uint8)
             images[camera_index] = Image.fromarray(target)
             pasted += 1
+        data_dict['camera_imgs'] = images
+        data_dict['multimodal_patches_pasted'] = np.asarray(
+            pasted, dtype=np.int64
+        )
+        return data_dict
+
+    def paste_source_multimodal_patches_reference(
+            self, data_dict, sampled_records, original_boxes3d,
+            original_boxes2d):
+        """Reproduce MMDataBaseSamplerV2 before ImageAug3D.
+
+        This intentionally preserves the released implementation's operation
+        order, integer box conversion, inverse paste permutation and the
+        ``[x1:x2, y1:y2]`` indexing used while restoring real foreground.
+        Camera images in this port are held in CCF-compatible BGR channel
+        order until normalization, so OpenCV patches are pasted without the
+        reference code's BGR-to-RGB swap; the later normalization performs
+        the corresponding whole-image channel swap.
+        """
+        images = data_dict['camera_imgs']
+        origin_images = images.copy()
+        num_original = len(original_boxes2d)
+        all_boxes3d = [
+            np.asarray(box, dtype=np.float32)
+            for box in original_boxes3d[:num_original]
+        ]
+        all_boxes2d = [
+            np.asarray(box, dtype=np.float32)
+            for box in original_boxes2d
+        ]
+        sampled_flags = [False] * num_original
+        sampled_lookup = [None] * num_original
+        for record in sampled_records:
+            all_boxes3d.append(np.asarray(
+                record['box3d_lidar'], dtype=np.float32
+            ))
+            all_boxes2d.append(np.asarray(
+                record['box2d_camera'], dtype=np.float32
+            ))
+            sampled_flags.append(True)
+            sampled_lookup.append(record)
+
+        if not all_boxes3d:
+            data_dict['multimodal_patches_pasted'] = np.asarray(
+                0, dtype=np.int64
+            )
+            return data_dict
+
+        all_boxes3d = np.stack(all_boxes3d, axis=0)
+        paste_order = np.argsort(-all_boxes3d[:, 0])
+        pasted = 0
+        # This is deliberately the inverse-permutation loop present in the
+        # released MMDataBaseSamplerV2, not a simplified sorted iteration.
+        for object_index in range(len(all_boxes3d)):
+            index = int(np.where(paste_order == object_index)[0][0])
+            box2d = all_boxes2d[index]
+            camera_index = int(box2d[4])
+            if camera_index < 0 or camera_index >= len(images):
+                continue
+            x1, y1, x2, y2 = [int(value) for value in box2d[:4]]
+
+            if not sampled_flags[index]:
+                target = np.asarray(images[camera_index]).copy()
+                original = np.asarray(origin_images[camera_index])
+                # Bug-compatible indexing required for strict reproduction.
+                target[x1:x2, y1:y2] = (
+                    self.multimodal_mixup * original[x1:x2, y1:y2]
+                    + (1.0 - self.multimodal_mixup)
+                    * target[x1:x2, y1:y2]
+                ).astype(np.uint8)
+                images[camera_index] = Image.fromarray(target)
+                continue
+
+            record = sampled_lookup[index]
+            patch_path = Path(record['image_path'])
+            if not patch_path.is_absolute():
+                patch_path = self.root_path / patch_path
+            patch = cv2.imread(str(patch_path), cv2.IMREAD_COLOR)
+            if patch is None:
+                raise FileNotFoundError(patch_path)
+            target = np.asarray(images[camera_index]).copy()
+            image_height, image_width = target.shape[:2]
+            width = max(min(x2, image_width - 1) - x1 + 1, 1)
+            height = max(min(y2, image_height - 1) - y1 + 1, 1)
+            patch = patch[:height, :width]
+            height, width = patch.shape[:2]
+            if height == 0 or width == 0:
+                continue
+            mask = np.zeros((height, width), dtype=np.float32)
+            margin_height = int(0.05 * height)
+            margin_width = int(0.05 * width)
+            mask[
+                margin_height:height - margin_height,
+                margin_width:width - margin_width,
+            ] = 1.0
+            paste_mask = 1.0 - mask * self.multimodal_mixup
+            region = target[y1:y1 + height, x1:x1 + width]
+            # Clipped database boxes are non-negative; retain a clear error if
+            # a malformed DB record violates the reference assumption.
+            if region.shape[:2] != (height, width):
+                raise ValueError(
+                    f'invalid reference paste box {box2d.tolist()} for '
+                    f'image {(image_width, image_height)}'
+                )
+            region = (
+                region.astype(np.float32) * paste_mask[..., None]
+                + self.multimodal_mixup * patch.astype(np.float32)
+                * mask[..., None]
+            ).astype(np.uint8)
+            target[y1:y1 + height, x1:x1 + width] = region
+            images[camera_index] = Image.fromarray(target)
+            pasted += 1
+
         data_dict['camera_imgs'] = images
         data_dict['multimodal_patches_pasted'] = np.asarray(
             pasted, dtype=np.int64

@@ -5,12 +5,16 @@ from pcdet.ops.iou3d_nms import iou3d_nms_cuda
 
 def height_overlaps(boxes1, boxes2):
     """
-    Calculate height overlaps of two boxes.
+    Calculate height overlaps for gravity-centred OpenPCDet boxes.
+
+    nuScenes boxes in the native OpenPCDet pipeline store ``z`` at the box
+    gravity centre.  Therefore the vertical interval is ``z +/- h / 2``;
+    treating it as ``[z, z + h]`` silently changes the Hungarian IoU cost.
     """
-    boxes1_top_height = (boxes1[:,2]+ boxes1[:,5]).view(-1, 1)
-    boxes1_bottom_height = boxes1[:,2].view(-1, 1)
-    boxes2_top_height = (boxes2[:,2]+boxes2[:,5]).view(1, -1)
-    boxes2_bottom_height = boxes2[:,2].view(1, -1)
+    boxes1_top_height = (boxes1[:, 2] + boxes1[:, 5] / 2).view(-1, 1)
+    boxes1_bottom_height = (boxes1[:, 2] - boxes1[:, 5] / 2).view(-1, 1)
+    boxes2_top_height = (boxes2[:, 2] + boxes2[:, 5] / 2).view(1, -1)
+    boxes2_bottom_height = (boxes2[:, 2] - boxes2[:, 5] / 2).view(1, -1)
 
     heighest_of_bottom = torch.max(boxes1_bottom_height, boxes2_bottom_height)
     lowest_of_top = torch.min(boxes1_top_height, boxes2_top_height)

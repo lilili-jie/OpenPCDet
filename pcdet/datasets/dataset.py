@@ -135,6 +135,15 @@ class DatasetTemplate(torch_data.Dataset):
         """
             Get lidar augment matrix (4 x 4), which are used to recover orig point coordinates.
         """
+        # IS-Fusion geometry augmentors compose this matrix at the moment each
+        # transform is applied.  Preserve that exact order (notably F @ G for
+        # GlobalRotScaleTransV2 followed by RandomFlip3DV2).
+        if '_lidar_aug_matrix_composed' in data_dict:
+            data_dict['lidar_aug_matrix'] = data_dict.pop(
+                '_lidar_aug_matrix_composed'
+            )
+            return data_dict
+
         lidar_aug_matrix = np.eye(4)
         if 'flip_y' in data_dict.keys():
             flip_x = data_dict['flip_x']

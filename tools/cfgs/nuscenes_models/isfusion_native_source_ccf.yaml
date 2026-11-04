@@ -38,6 +38,9 @@ DATA_CONFIG:
             FINAL_DIM: [384, 1056]
             RESIZE_LIM_TRAIN: [0.57, 0.825]
             RESIZE_LIM_TEST: [0.72, 0.72]
+            # Match IS-Fusion: paste GT crops on raw images, then apply one
+            # whole-image ImageAug3D transform.
+            DEFER_RESIZE_CROP_TO_AUGMENTOR: True
     DATA_AUGMENTOR:
         DISABLE_AUG_LIST: ['placeholder']
         AUG_CONFIG_LIST:
@@ -69,14 +72,19 @@ DATA_CONFIG:
               # Reference MMDataBaseSamplerV2 default: sampled objects from
               # different classes are not added to the collision-avoid set.
               COLLISION_IN_CLASSES: False
+              REFERENCE_PASTE_ORDER: True
 
             - NAME: isfusion_modal_mask
               NUM_DROP_VIEWS: 3
               DROP_PROBABILITY: 0.5
 
-            # ImageAug3D's resize/crop is performed while loading cameras;
-            # this stage adds its per-view flip and rotation.
+            # Match the reference ImageAug3D stage after ObjectSampleV2 and
+            # ModalMask3D: resize/crop/flip/rotate each complete image here.
             - NAME: imgaug
+              REFERENCE_IMAGE_AUG_3D: True
+              FINAL_DIM: [384, 1056]
+              RESIZE_LIM: [0.57, 0.825]
+              BOT_PCT_LIM: [0.0, 0.0]
               ROT_LIM: [-5.4, 5.4]
               RAND_FLIP: True
 
@@ -233,9 +241,11 @@ OPTIMIZATION:
     # Equivalent to the original EmptyCacheHook(after_iter=True).
     EMPTY_CACHE_AFTER_ITER: True
 
-# ObjectSampleV2 and ModalMask3D use stop_epoch=total_epochs-2 in the
-# reference.  Keep image/global geometric augmentation enabled throughout.
+# ObjectSampleV2 honors stop_epoch=total_epochs-2 in the reference. Although
+# the released config also passes stop_epoch to ModalMask3D, that class accepts
+# it only through **kwargs and never checks it, so ModalMask remains active.
+# Keep ModalMask and image/global geometric augmentation enabled throughout.
 HOOK:
     DisableAugmentationHook:
-        DISABLE_AUG_LIST: ['gt_sampling', 'isfusion_modal_mask']
+        DISABLE_AUG_LIST: ['gt_sampling']
         NUM_LAST_EPOCHS: 2

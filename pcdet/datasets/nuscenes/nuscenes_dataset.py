@@ -314,8 +314,26 @@ class NuScenesDataset(DatasetTemplate):
         input_dict["camera_imgs"] = images
         input_dict["ori_shape"] = images[0].size
         
-        # resize and crop image
-        input_dict = self.crop_image(input_dict)
+        # The reference IS-Fusion pipeline performs multimodal GT sampling on
+        # the original-resolution images and only then runs ImageAug3D.  Keep
+        # raw images during training when that ordering is requested; the
+        # imgaug queue item will perform resize/crop/flip/rotation together.
+        # Evaluation intentionally retains the already validated deterministic
+        # crop path.
+        defer_train_image_aug = bool(
+            self.training
+            and self.camera_image_config.get(
+                'DEFER_RESIZE_CROP_TO_AUGMENTOR', False
+            )
+        )
+        if not defer_train_image_aug:
+            input_dict = self.crop_image(input_dict)
+        else:
+            input_dict['img_process_infos'] = [
+                [1.0, (0, 0, images[0].size[0], images[0].size[1]),
+                 False, 0.0]
+                for _ in images
+            ]
 
         if (ccf_compatible_io and not self.camera_config.get(
                 'CCF_COMPATIBLE_NORMALIZATION', False)):

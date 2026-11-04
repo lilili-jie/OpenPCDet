@@ -1,0 +1,17 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf.yaml
+
+# Short Source-only fine-tuning initialized from checkpoints/isfusion_source.pth.
+# The checkpoint is passed with --pretrained_model so optimizer/scheduler state
+# and the original epoch counter are intentionally not restored.
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 2
+    NUM_EPOCHS: 2
+    # One tenth of the base recipe's 5e-4 peak LR for conservative fine-tuning.
+    LR: 0.00005
+
+# Keep every augmentation enabled in both fine-tuning epochs. With
+# NUM_LAST_EPOCHS=0 the disable condition cannot trigger before training ends.
+HOOK:
+    DisableAugmentationHook:
+        DISABLE_AUG_LIST: ['gt_sampling', 'isfusion_modal_mask']
+        NUM_LAST_EPOCHS: 0

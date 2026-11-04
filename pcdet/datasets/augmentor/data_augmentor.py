@@ -62,12 +62,19 @@ class DataAugmentor(object):
         if data_dict is None:
             return partial(self.random_world_flip, config=config)
         gt_boxes, points = data_dict['gt_boxes'], data_dict['points']
+        flip_transform = np.eye(4, dtype=np.float32)
         for cur_axis in config['ALONG_AXIS_LIST']:
             assert cur_axis in ['x', 'y']
             gt_boxes, points, enable = getattr(augmentor_utils, 'random_flip_along_%s' % cur_axis)(
                 gt_boxes, points, return_flip=True
             )
             data_dict['flip_%s'%cur_axis] = enable
+            if enable:
+                if cur_axis == 'x':
+                    axis_transform = np.diag([1, -1, 1, 1]).astype(np.float32)
+                else:
+                    axis_transform = np.diag([-1, 1, 1, 1]).astype(np.float32)
+                flip_transform = axis_transform @ flip_transform
             if 'roi_boxes' in data_dict.keys():
                 num_frame, num_rois,dim = data_dict['roi_boxes'].shape
                 roi_boxes, _, _ = getattr(augmentor_utils, 'random_flip_along_%s' % cur_axis)(
@@ -77,6 +84,7 @@ class DataAugmentor(object):
 
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
+        _left_compose_lidar_augmentation(data_dict, flip_transform)
         return data_dict
 
     def random_world_rotation(self, data_dict=None, config=None):
@@ -276,7 +284,32 @@ class DataAugmentor(object):
         imgs = data_dict["camera_imgs"]
         img_process_infos = data_dict['img_process_infos']
         new_imgs = []
+        reference_order = bool(config.get('REFERENCE_IMAGE_AUG_3D', False))
         for img, img_process_info in zip(imgs, img_process_infos):
+            if reference_order:
+                width, height = data_dict['ori_shape']
+                final_height, final_width = config.FINAL_DIM
+                resize = np.random.uniform(*config.RESIZE_LIM)
+                resize_dims = (
+                    int(width * resize), int(height * resize)
+                )
+                new_width, new_height = resize_dims
+                bottom_pct = np.random.uniform(*config.BOT_PCT_LIM)
+                crop_height = int(
+                    (1 - bottom_pct) * new_height
+                ) - final_height
+                crop_width = int(np.random.uniform(
+                    0, max(0, new_width - final_width)
+                ))
+                crop = (
+                    crop_width, crop_height,
+                    crop_width + final_width,
+                    crop_height + final_height,
+                )
+                img = img.resize(resize_dims)
+                img = img.crop(crop)
+                img_process_info[0] = resize
+                img_process_info[1] = crop
             flip = False
             if config.RAND_FLIP and np.random.choice([0, 1]):
                 flip = True
@@ -345,6 +378,15 @@ class DataAugmentor(object):
         data_dict['noise_rot'] = rotation
         data_dict['noise_scale'] = scale
         data_dict['noise_translate'] = (translation * scale).reshape(1, 3)
+        transform = np.eye(4, dtype=np.float32)
+        cosine, sine = np.cos(rotation), np.sin(rotation)
+        transform[:3, :3] = np.asarray([
+            [cosine, -sine, 0.0],
+            [sine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32) * scale
+        transform[:3, 3] = translation * scale
+        _left_compose_lidar_augmentation(data_dict, transform)
         return data_dict
 
     def forward(self, data_dict):
@@ -385,3 +427,18 @@ class DataAugmentor(object):
 
             data_dict.pop('gt_boxes_mask')
         return data_dict
+
+def _left_compose_lidar_augmentation(data_dict, transform):
+    """Record transforms in their real execution order.
+
+    If points are changed by ``p' = A p`` after earlier transforms ``B``, the
+    complete transform is ``A @ B``.  Reconstructing the matrix later from
+    independent flip/rotation flags is incorrect because these transforms do
+    not commute and because a later flip must also rotate the translation.
+    """
+    previous = data_dict.get(
+        '_lidar_aug_matrix_composed', np.eye(4, dtype=np.float32)
+    )
+    data_dict['_lidar_aug_matrix_composed'] = (
+        np.asarray(transform, dtype=np.float32) @ previous
+    )
