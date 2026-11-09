@@ -5,6 +5,7 @@ Mostly copy-paste from
     
 """
 
+import random
 import warnings
 from collections import OrderedDict
 from copy import deepcopy
@@ -17,6 +18,7 @@ import torch.utils.checkpoint as cp
 from ..model_utils.swin_utils import swin_converter
 from ..model_utils.swin_utils import PatchEmbed, PatchMerging
 from ..model_utils.swin_utils import FFN, DropPath, to_2tuple, trunc_normal_, trunc_normal_init, constant_init
+from ..domain_generalization import NormalizationPerturbation
 
 
 class WindowMSA(nn.Module):
@@ -437,9 +439,14 @@ class SwinBlockSequence(nn.Module):
 
         self.downsample = downsample
 
-    def forward(self, x, hw_shape):
+    def forward(self, x, hw_shape, pre_downsample_transform=None):
         for block in self.blocks:
             x = block(x, hw_shape)
+
+        # NP/NP+ must modify the shallow stage output before PatchMerging;
+        # changing the returned ``out`` afterwards would not affect x_down.
+        if pre_downsample_transform is not None:
+            x = pre_downsample_transform(x, hw_shape)
 
         if self.downsample:
             x_down, down_hw_shape = self.downsample(x, hw_shape)
@@ -506,7 +513,11 @@ class SwinTransformer(nn.Module):
     """
 
     def __init__(self, model_cfg):
-        
+        # Initialize ``nn.Module`` before registering the optional NP/NP+
+        # perturbation module below.  The original implementation did this
+        # later because it only assigned plain Python values beforehand.
+        super(SwinTransformer, self).__init__()
+
         self.model_cfg = model_cfg
         pretrain_img_size = self.model_cfg.get('PRETRAIN_IMG_SIZE', 224)
         init_cfg = self.model_cfg.get('INIT_CFG', None)
@@ -532,6 +543,37 @@ class SwinTransformer(nn.Module):
 
         self.convert_weights = self.model_cfg.get('CONVERT_WEIGHTS', False)
         self.frozen_stages = self.model_cfg.get('FROZEN_STAGES', -1)
+        perturbation_cfg = self.model_cfg.get('FEATURE_PERTURBATION', None)
+        if perturbation_cfg and perturbation_cfg.get('ENABLED', False):
+            self.feature_perturbation = NormalizationPerturbation(
+                method=perturbation_cfg.get('METHOD', 'np'),
+                noise_std=perturbation_cfg.get('NOISE_STD', 0.75),
+                mean_scale_factor=perturbation_cfg.get(
+                    'MEAN_SCALE_FACTOR', 1.5
+                ),
+                eps=perturbation_cfg.get('EPS', 1e-6),
+            )
+            self.feature_perturbation_probability = float(
+                perturbation_cfg.get('PROBABILITY', 0.5)
+            )
+            self.feature_perturbation_placement = str(
+                perturbation_cfg.get('PLACEMENT', 'appendix_b')
+            ).lower()
+            if self.feature_perturbation_placement not in {
+                'appendix_b', 'output_branches'
+            }:
+                raise ValueError(
+                    'FEATURE_PERTURBATION.PLACEMENT must be either '
+                    f"'appendix_b' or 'output_branches', got "
+                    f"{self.feature_perturbation_placement!r}"
+                )
+        else:
+            self.feature_perturbation = None
+            self.feature_perturbation_probability = 0.0
+            self.feature_perturbation_placement = 'appendix_b'
+        self.last_perturbation_applied = False
+        self.last_perturbation_site_count = 0
+        self.last_perturbation_stage_indices = []
 
         if isinstance(pretrain_img_size, int):
             pretrain_img_size = to_2tuple(pretrain_img_size)
@@ -542,7 +584,6 @@ class SwinTransformer(nn.Module):
                 f'The size of image should have length 1 or 2, ' \
                 f'but got {len(pretrain_img_size)}'
 
-        super(SwinTransformer, self).__init__()
         self.init_cfg = init_cfg
 
         num_layers = len(depths)
@@ -723,15 +764,51 @@ class SwinTransformer(nn.Module):
             x = x + self.absolute_pos_embed
         x = self.drop_after_pos(x)
 
+        # Appendix-B mode samples p once and perturbs the backbone main path at
+        # two shallow sites.  The MMDetection-CCF-compatible output-branches
+        # mode instead samples independently for each selected stage output;
+        # it never changes ``x`` flowing into the following Swin stage.
+        apply_appendix_b_perturbation = bool(
+            self.training
+            and self.feature_perturbation is not None
+            and self.feature_perturbation_placement == 'appendix_b'
+            and random.random() < self.feature_perturbation_probability
+        )
+        self.last_perturbation_applied = apply_appendix_b_perturbation
+        self.last_perturbation_site_count = 0
+        self.last_perturbation_stage_indices = []
+        if apply_appendix_b_perturbation:
+            x = self.feature_perturbation.forward_tokens(x, hw_shape)
+            self.last_perturbation_site_count += 1
+
         outs = []
         for i, stage in enumerate(self.stages):
-            x, hw_shape, out, out_hw_shape = stage(x, hw_shape)
+            transform = (
+                self.feature_perturbation.forward_tokens
+                if apply_appendix_b_perturbation and i == 0 else None
+            )
+            x, hw_shape, out, out_hw_shape = stage(
+                x, hw_shape, pre_downsample_transform=transform
+            )
+            if transform is not None:
+                self.last_perturbation_site_count += 1
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
                 out = norm_layer(out)
                 out = out.view(-1, *out_hw_shape,
                                self.num_features[i]).permute(0, 3, 1,
                                                              2).contiguous()
+                apply_output_perturbation = bool(
+                    self.training
+                    and self.feature_perturbation is not None
+                    and self.feature_perturbation_placement == 'output_branches'
+                    and random.random() < self.feature_perturbation_probability
+                )
+                if apply_output_perturbation:
+                    out = self.feature_perturbation(out)
+                    self.last_perturbation_applied = True
+                    self.last_perturbation_site_count += 1
+                    self.last_perturbation_stage_indices.append(i)
                 outs.append(out)
         batch_dict['image_features'] = outs
         return batch_dict

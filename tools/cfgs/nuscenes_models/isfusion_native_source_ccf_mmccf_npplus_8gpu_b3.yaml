@@ -1,0 +1,15 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf_8gpu_b3_full_final_success.yaml
+
+# MMDetection-CCF-compatible Swin-NP+ feature-only control experiment.  This
+# intentionally excludes the paper's extra photometric augmentation so that
+# its behavior matches mmdetection_ccf/mmdet/models/backbones/swin.py.
+MODEL:
+    IMAGE_BACKBONE:
+        FEATURE_PERTURBATION:
+            ENABLED: True
+            METHOD: np_plus
+            PLACEMENT: output_branches
+            PROBABILITY: 0.5
+            NOISE_STD: 0.75
+            MEAN_SCALE_FACTOR: 1.5
+            EPS: 0.000001

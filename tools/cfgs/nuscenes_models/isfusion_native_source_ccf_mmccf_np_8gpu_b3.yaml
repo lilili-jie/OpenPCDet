@@ -1,0 +1,15 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf_8gpu_b3_full_final_success.yaml
+
+# MMDetection-CCF-compatible Swin-NP control experiment.  Perturb only the
+# normalized outputs selected by OUT_INDICES before they enter IMAGE_NECK;
+# the Swin main path remains clean and each output stage samples p separately.
+MODEL:
+    IMAGE_BACKBONE:
+        FEATURE_PERTURBATION:
+            ENABLED: True
+            METHOD: np
+            PLACEMENT: output_branches
+            PROBABILITY: 0.5
+            NOISE_STD: 0.75
+            MEAN_SCALE_FACTOR: 1.5
+            EPS: 0.000001

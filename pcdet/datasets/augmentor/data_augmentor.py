@@ -7,6 +7,7 @@ import random
 
 from ...utils import common_utils
 from . import augmentor_utils, database_sampler
+from .np_photometric import NPPlusPhotometricAugmentation
 
 
 class DataAugmentor(object):
@@ -323,6 +324,21 @@ class DataAugmentor(object):
             new_imgs.append(img)
 
         data_dict["camera_imgs"] = new_imgs
+        return data_dict
+
+    def np_plus_photometric(self, data_dict=None, config=None,
+                            augmenter=None):
+        """Apply the NP+ appendix photometric recipe per camera image."""
+        if data_dict is None:
+            augmenter = NPPlusPhotometricAugmentation(config)
+            return partial(
+                self.np_plus_photometric,
+                config=config,
+                augmenter=augmenter,
+            )
+        data_dict['camera_imgs'] = [
+            augmenter(image) for image in data_dict['camera_imgs']
+        ]
         return data_dict
 
     def isfusion_modal_mask(self, data_dict=None, config=None):
