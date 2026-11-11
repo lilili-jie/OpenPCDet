@@ -1,0 +1,93 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf_8gpu_b3_full_final_success.yaml
+
+# B4 + NP+ photometric recipe.
+#
+# Keep the complete B4 model/training protocol unchanged.  The only added
+# variable is the four-transform NP+ image-space recipe.  No NP+ feature
+# perturbation is enabled: LGFSP remains the sole feature-space perturbation.
+MODEL:
+    IMAGE_BACKBONE:
+        FEATURE_PERTURBATION:
+            ENABLED: True
+            METHOD: lgfsp
+            PLACEMENT: output_branches
+            PROBABILITY: 0.5
+            NOISE_STD: 0.75
+            NUM_VIEWS: 6
+            EXPECTED_BATCH_SIZE: 3
+            STRICT_BATCH_SIZE: True
+            STATISTICS_SCOPE: global_ddp
+            EXPECTED_WORLD_SIZE: 8
+            STRICT_WORLD_SIZE: True
+            STYLE_STD_WEIGHT: 1.0
+            SEMANTIC_WEIGHT: 1.0
+            WEIGHT_MODE: semantic_only
+            EXCLUDE_MASKED_CAMERAS_FROM_STYLE: True
+            MATCH_COMBINED_WEIGHT_DISTRIBUTION: True
+            WEIGHT_MIN: 0.0
+            WEIGHT_MAX: 1.0
+            FALLBACK_R: 0.5
+            MIN_BACKGROUND_PIXELS: 16
+            MIN_POINTS_PER_INSTANCE: 1
+            MAX_POINTS_PER_INSTANCE: 64
+            EPS: 0.000001
+
+DATA_CONFIG:
+    DATA_AUGMENTOR:
+        AUG_CONFIG_LIST:
+            - NAME: gt_sampling
+              DB_INFO_PATH:
+                  - pkl_10history_unpadded/nuscenes_dbinfos_source_10history_withvelo_multimodal.pkl
+              PREPARE: {
+                 filter_by_min_points: [
+                     'car:5', 'truck:5', 'construction_vehicle:5', 'bus:5',
+                     'trailer:5', 'barrier:5', 'motorcycle:5', 'bicycle:5',
+                     'pedestrian:5', 'traffic_cone:5'
+                 ],
+              }
+              SAMPLE_GROUPS: [
+                  'car:2', 'truck:3', 'construction_vehicle:7', 'bus:4',
+                  'trailer:6', 'barrier:2', 'motorcycle:6', 'bicycle:6',
+                  'pedestrian:2', 'traffic_cone:2'
+              ]
+              NUM_POINT_FEATURES: 5
+              DATABASE_WITH_FAKELIDAR: False
+              REMOVE_EXTRA_WIDTH: [0.0, 0.0, 0.0]
+              LIMIT_WHOLE_SCENE: True
+              SOURCE_MULTIMODAL: True
+              MIXUP: 0.7
+              CHECK_2D_COLLISION: True
+              COLLISION_THR: [0.0, 0.3, 0.5, 0.7]
+              COLLISION_IN_CLASSES: False
+              REFERENCE_PASTE_ORDER: True
+
+            - NAME: isfusion_modal_mask
+              NUM_DROP_VIEWS: 3
+              DROP_PROBABILITY: 0.5
+
+            - NAME: imgaug
+              REFERENCE_IMAGE_AUG_3D: True
+              FINAL_DIM: [384, 1056]
+              RESIZE_LIM: [0.57, 0.825]
+              BOT_PCT_LIM: [0.0, 0.0]
+              ROT_LIM: [-5.4, 5.4]
+              RAND_FLIP: True
+
+            # NP+ Appendix-B image-space transforms.  Each camera samples
+            # these independently; geometry and calibration are unchanged.
+            - NAME: np_plus_photometric
+              COLOR_JITTER: [0.4, 0.4, 0.2, 0.1]
+              COLOR_JITTER_PROBABILITY: 0.8
+              GRAYSCALE_PROBABILITY: 0.3
+              BLUR_PROBABILITY: 0.3
+              BLUR_SIGMA: [0.1, 2.0]
+              SOLARIZE_PROBABILITY: 0.3
+              CCF_COMPATIBLE_BGR: True
+
+            - NAME: isfusion_global_transform
+              ROT_LIM: [-0.78539816, 0.78539816]
+              SCALE_LIM: [0.9, 1.1]
+              TRANS_STD: 0.5
+
+            - NAME: random_world_flip
+              ALONG_AXIS_LIST: ['x', 'y']

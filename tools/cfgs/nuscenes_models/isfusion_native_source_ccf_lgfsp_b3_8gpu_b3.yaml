@@ -1,0 +1,28 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf_8gpu_b3_full_final_success.yaml
+
+# B3: LiDAR-guided geometry-aware feature style perturbation.
+# Statistics are local to each DDP process: 3 nuScenes samples, i.e. 18
+# camera images.  No S/R/W all-reduce or all-gather is performed.
+MODEL:
+    IMAGE_BACKBONE:
+        FEATURE_PERTURBATION:
+            ENABLED: True
+            METHOD: lgfsp
+            PLACEMENT: output_branches
+            PROBABILITY: 0.5
+            NOISE_STD: 0.75
+            NUM_VIEWS: 6
+            EXPECTED_BATCH_SIZE: 3
+            STRICT_BATCH_SIZE: True
+            STYLE_STD_WEIGHT: 1.0
+            SEMANTIC_WEIGHT: 1.0
+            WEIGHT_MODE: combined
+            EXCLUDE_MASKED_CAMERAS_FROM_STYLE: True
+            MATCH_COMBINED_WEIGHT_DISTRIBUTION: False
+            WEIGHT_MIN: 0.0
+            WEIGHT_MAX: 1.0
+            FALLBACK_R: 0.5
+            MIN_BACKGROUND_PIXELS: 16
+            MIN_POINTS_PER_INSTANCE: 1
+            MAX_POINTS_PER_INSTANCE: 64
+            EPS: 0.000001

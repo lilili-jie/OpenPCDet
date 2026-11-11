@@ -18,7 +18,10 @@ import torch.utils.checkpoint as cp
 from ..model_utils.swin_utils import swin_converter
 from ..model_utils.swin_utils import PatchEmbed, PatchMerging
 from ..model_utils.swin_utils import FFN, DropPath, to_2tuple, trunc_normal_, trunc_normal_init, constant_init
-from ..domain_generalization import NormalizationPerturbation
+from ..domain_generalization import (
+    LiDARGuidedFeatureStylePerturbation,
+    NormalizationPerturbation,
+)
 
 
 class WindowMSA(nn.Module):
@@ -545,14 +548,22 @@ class SwinTransformer(nn.Module):
         self.frozen_stages = self.model_cfg.get('FROZEN_STAGES', -1)
         perturbation_cfg = self.model_cfg.get('FEATURE_PERTURBATION', None)
         if perturbation_cfg and perturbation_cfg.get('ENABLED', False):
-            self.feature_perturbation = NormalizationPerturbation(
-                method=perturbation_cfg.get('METHOD', 'np'),
-                noise_std=perturbation_cfg.get('NOISE_STD', 0.75),
-                mean_scale_factor=perturbation_cfg.get(
-                    'MEAN_SCALE_FACTOR', 1.5
-                ),
-                eps=perturbation_cfg.get('EPS', 1e-6),
-            )
+            self.feature_perturbation_method = str(
+                perturbation_cfg.get('METHOD', 'np')
+            ).lower()
+            if self.feature_perturbation_method == 'lgfsp':
+                self.feature_perturbation = (
+                    LiDARGuidedFeatureStylePerturbation(perturbation_cfg)
+                )
+            else:
+                self.feature_perturbation = NormalizationPerturbation(
+                    method=self.feature_perturbation_method,
+                    noise_std=perturbation_cfg.get('NOISE_STD', 0.75),
+                    mean_scale_factor=perturbation_cfg.get(
+                        'MEAN_SCALE_FACTOR', 1.5
+                    ),
+                    eps=perturbation_cfg.get('EPS', 1e-6),
+                )
             self.feature_perturbation_probability = float(
                 perturbation_cfg.get('PROBABILITY', 0.5)
             )
@@ -567,8 +578,16 @@ class SwinTransformer(nn.Module):
                     f"'appendix_b' or 'output_branches', got "
                     f"{self.feature_perturbation_placement!r}"
                 )
+            if (
+                self.feature_perturbation_method == 'lgfsp'
+                and self.feature_perturbation_placement != 'output_branches'
+            ):
+                raise ValueError(
+                    'LGFSP is defined only for clean-main-path output branches'
+                )
         else:
             self.feature_perturbation = None
+            self.feature_perturbation_method = None
             self.feature_perturbation_probability = 0.0
             self.feature_perturbation_placement = 'appendix_b'
         self.last_perturbation_applied = False
@@ -804,8 +823,32 @@ class SwinTransformer(nn.Module):
                     and self.feature_perturbation_placement == 'output_branches'
                     and random.random() < self.feature_perturbation_probability
                 )
+                if (
+                    self.training
+                    and self.feature_perturbation_method == 'lgfsp'
+                    and self.feature_perturbation.uses_global_ddp_statistics
+                ):
+                    # Every rank consumes its normal Python RNG draw above,
+                    # but rank 0 decides whether this output level enters the
+                    # collective LGFSP path.  Without this synchronization,
+                    # independent probability draws can deadlock all_gather.
+                    statistics_world_size = (
+                        self.feature_perturbation._distributed_world_size()
+                    )
+                    if statistics_world_size > 1:
+                        apply_flag = torch.tensor(
+                            [int(apply_output_perturbation)],
+                            dtype=torch.uint8, device=out.device,
+                        )
+                        torch.distributed.broadcast(apply_flag, src=0)
+                        apply_output_perturbation = bool(apply_flag.item())
                 if apply_output_perturbation:
-                    out = self.feature_perturbation(out)
+                    if self.feature_perturbation_method == 'lgfsp':
+                        out = self.feature_perturbation(
+                            out, batch_dict=batch_dict, stage_index=i
+                        )
+                    else:
+                        out = self.feature_perturbation(out)
                     self.last_perturbation_applied = True
                     self.last_perturbation_site_count += 1
                     self.last_perturbation_stage_indices.append(i)

@@ -1,0 +1,35 @@
+_BASE_CONFIG_: cfgs/nuscenes_models/isfusion_native_source_ccf_8gpu_b3_full_final_success.yaml
+
+# LGFSP global-24 R-ranking experiment.
+#
+# Eight DDP ranks x three nuScenes samples form one 24-sample statistics pool.
+# Both background style S and instance semantics R are computed globally.
+# The reference Combined weights preserve the original perturbation-strength
+# multiset, while (1-R_global24) alone decides which channel receives each
+# value.  Thus S affects strength distribution but not channel assignment.
+MODEL:
+    IMAGE_BACKBONE:
+        FEATURE_PERTURBATION:
+            ENABLED: True
+            METHOD: lgfsp
+            PLACEMENT: output_branches
+            PROBABILITY: 0.5
+            NOISE_STD: 0.75
+            NUM_VIEWS: 6
+            EXPECTED_BATCH_SIZE: 3
+            STRICT_BATCH_SIZE: True
+            STATISTICS_SCOPE: global_ddp
+            EXPECTED_WORLD_SIZE: 8
+            STRICT_WORLD_SIZE: True
+            STYLE_STD_WEIGHT: 1.0
+            SEMANTIC_WEIGHT: 1.0
+            WEIGHT_MODE: semantic_only
+            EXCLUDE_MASKED_CAMERAS_FROM_STYLE: True
+            MATCH_COMBINED_WEIGHT_DISTRIBUTION: True
+            WEIGHT_MIN: 0.0
+            WEIGHT_MAX: 1.0
+            FALLBACK_R: 0.5
+            MIN_BACKGROUND_PIXELS: 16
+            MIN_POINTS_PER_INSTANCE: 1
+            MAX_POINTS_PER_INSTANCE: 64
+            EPS: 0.000001
